@@ -26,6 +26,14 @@ optdepends=('rosec-bin: unlock the rosec vault automatically on screen unlock'
 # git: the saola-theme dependency is a git dependency (pinned to a release
 # tag in Cargo.toml), so `cargo fetch` needs git available.
 makedepends=('cargo' 'git')
+# makepkg enables LTO by default (pacman >= 6.1) by appending -flto=auto to
+# CFLAGS. Rust code is unaffected (RUSTFLAGS is never touched), but ring —
+# pulled in via ureq -> rustls for the temperature fetch — compiles its C and
+# assembly sources through the cc crate, which forwards those CFLAGS. The
+# resulting GCC bitcode objects can't be consumed by rustc's final link, so
+# the build fails on stock Arch. The sibling Saola PKGBUILDs don't need this
+# line because nothing in their trees compiles C at build time.
+options=('!lto')
 # The PAM policy is user-editable system configuration (e.g. removing the
 # rosec line on a machine without rosec) — preserve local edits on upgrade.
 backup=('etc/pam.d/saola-lockscreen')
