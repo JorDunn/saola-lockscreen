@@ -5,13 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] - 2026-08-05
 
-Nothing has been tagged yet — `Cargo.toml` stays at `0.1.0-dev` until real-session
-testing (see `docs/REVIEW-v0.1.md` and this stage's handoff) confirms a working PAM
-round-trip. This entry covers Stage 6's security review and Stage 7's response to it;
-earlier stages (crate skeleton through the temperature module) are not re-itemized here
-since nothing shipped as a release before this point.
+The first release. Real-session testing passed 2026-08-05 — lock via loginctl and
+before suspend (driven by saola-session, which depends on this package), PAM unlock
+on every attempt, and the 20 s idle-timeout path twice — which was the gate this
+version sat behind at `0.1.0-dev`. This entry covers Stage 6's security review and
+Stage 7's response to it; earlier stages (crate skeleton through the temperature
+module) are not re-itemized here since nothing shipped as a release before this point.
 
 ### Security
 
