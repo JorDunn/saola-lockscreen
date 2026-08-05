@@ -1,0 +1,45 @@
+#%PAM-1.0
+# PAM service file for saola-lockscreen (src/auth.rs's SERVICE constant).
+# Install as /etc/pam.d/saola-lockscreen — see contrib/session/README.md for
+# the exact root command and why this supersedes an older interim command
+# from Stage 4's handoff.
+#
+# A locker calls exactly two PAM functions (src/auth.rs's `run_pam`):
+# pam_authenticate() and pam_acct_mgmt(). It never opens a session and never
+# changes a password, so this file deliberately has no `session` or
+# `password` stack — there would be nothing to run them for.
+#
+# `account include system-auth` is not optional. Stage 4's original handoff
+# printed an `auth include system-auth`-only version of this file; Stage 6's
+# security review (docs/REVIEW-v0.1.md, finding H-2) found that with no
+# `account` stack at all, pam_acct_mgmt() returns PAM_PERM_DENIED — Linux-PAM
+# does NOT fall back to /etc/pam.d/other for a service file that exists but
+# has an empty phase, only for a service file that is missing entirely. The
+# result: a correct password authenticates, then the account check fails,
+# and src/auth.rs's classify_failure() (before Stage 7's M-4 fix) reported
+# "Wrong password." for every attempt, correct or not, while still burning
+# the pam_faillock budget on the auth phase's own bookkeeping. See H-2's
+# full write-up for the failure trace. Reference for a service that
+# correctly runs both phases: /usr/lib/pam.d/polkit-1.
+auth      include   system-auth
+account   include   system-auth
+
+# rosec auto-unlock — the pam_exec fallback form, not the native
+# pam_rosec.so module. Per https://jmylchreest.github.io/rosec/pam
+# ("Fallback: pam_exec (no native module)"), the pam_exec approach "only
+# works for screen unlock (not initial login), because `pam_exec
+# expose_authtok` runs during the auth phase only — there is no
+# stash-and-replay for the session phase." That is exactly this crate's
+# situation (PLAN.md's Architecture decision): a locker never runs PAM's
+# session phase, so the native module's session-phase helper
+# (rosec-pam-unlock, normally invoked via `session include rosec`) would
+# never fire here even if wired in — only the auth-phase pam_exec form can
+# reach it. `expose_authtok` hands the just-verified password to the helper
+# via PAM's own authtok stash (not argv, not an env var); `quiet` suppresses
+# the helper's stdout/stderr going to the session's journal; `optional`
+# means this line can never itself block or deny the unlock (defense in
+# depth — rosec's own module already returns PAM_SUCCESS on every one of its
+# error paths, per that doc page's "Security" section). Placed after the
+# `auth include system-auth` line above, per the doc's own example ("add
+# after auth").
+auth      optional  pam_exec.so  expose_authtok quiet /usr/lib/rosec/rosec-pam-unlock

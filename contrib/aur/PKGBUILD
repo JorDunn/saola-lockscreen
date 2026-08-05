@@ -1,0 +1,74 @@
+# Maintainer: Jordan Dunn <jordan.dunn@nodetwo.io>
+#
+# Template — mirrors saola-panel's and saola-session's contrib/aur/PKGBUILD.
+# The @PKGVER@ placeholder and the SKIP checksum are filled in by CI: on each
+# GitHub release, .github/workflows/pkgbuild-release.yml substitutes the
+# version from the release tag, computes the tarball's real sha256, and
+# attaches the finished PKGBUILD to the release as an asset. (Not pushed to
+# the AUR — deliberately, for now.)
+
+pkgname=saola-lockscreen
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc='Session locker for the Saola desktop environment (niri, ext-session-lock-v1)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/JorDunn/saola-lockscreen'
+license=('MIT OR Apache-2.0')
+# `ldd` on the release binary shows only libpam (via pam-sys2) plus the C
+# runtime — the iced stack dlopens the rest at runtime instead of linking it:
+# libxkbcommon (keyboard handling), libwayland (the client stack), and the
+# Vulkan loader (wgpu's default backend), so those are runtime dependencies
+# ldd can't see. Same reasoning as saola-panel's depends= line, minus its
+# pulse/udev modules, plus PAM.
+depends=('gcc-libs' 'glibc' 'pam' 'libxkbcommon' 'wayland' 'vulkan-icd-loader')
+optdepends=('rosec-bin: unlock the rosec vault automatically on screen unlock'
+            'saola-session: idle and before-sleep locking that spawns this locker')
+# git: the saola-theme dependency is a git dependency (pinned to a release
+# tag in Cargo.toml), so `cargo fetch` needs git available.
+makedepends=('cargo' 'git')
+# The PAM policy is user-editable system configuration (e.g. removing the
+# rosec line on a machine without rosec) — preserve local edits on upgrade.
+backup=('etc/pam.d/saola-lockscreen')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/$pkgname-v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+# GitHub archives of tag saola-lockscreen-vX.Y.Z unpack to
+# saola-lockscreen-saola-lockscreen-vX.Y.Z (repo name + full tag; the
+# leading-"v" strip GitHub applies to v-prefixed tags doesn't fire here).
+_srcdir="$pkgname-$pkgname-v$pkgver"
+
+prepare() {
+  cd "$_srcdir"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_srcdir"
+  export RUSTUP_TOOLCHAIN=stable
+  # Deliberately no --features: the dev-unlock feature must never reach a
+  # packaged binary (CLAUDE.md's unlock-edge rule), and src/main.rs's
+  # compile_error! guard hard-fails a release build that tries.
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$_srcdir"
+  export RUSTUP_TOOLCHAIN=stable
+  # The state-machine unit tests are this crate's centre of gravity
+  # (CLAUDE.md's testing strategy) — they run against fake authenticators,
+  # no PAM service file or Wayland display needed, so they are safe in a
+  # chroot/clean build.
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$_srcdir"
+  install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  # The PAM service file src/auth.rs authenticates against — without it PAM
+  # denies every unlock attempt (see the file's own comments for why the
+  # account stack is not optional).
+  install -Dm644 contrib/pam/saola-lockscreen "$pkgdir/etc/pam.d/saola-lockscreen"
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}

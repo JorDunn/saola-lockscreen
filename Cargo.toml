@@ -1,0 +1,151 @@
+[package]
+name = "saola-lockscreen"
+version = "0.1.0-dev"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[features]
+# Escape-to-unlock for nested-niri testing ONLY (Architecture, PLAN.md). Never
+# default, never enabled in a release build. This feature gate must wrap the
+# entire unlock edge in `modules/reveal.rs` (Stage 4), not just the keybind —
+# the PAM-ok edge is the only other call site of the sessionlock unlock action.
+dev-unlock = []
+
+[dependencies]
+# `tag` and `version` must move together: `version` names the crate version
+# inside the tagged checkout, and cargo errors loudly if they disagree — see
+# saola-panel's Cargo.toml for the full history of why that's the point, not
+# a nuisance. Pinned to v0.5.0 (PLAN.md Architecture decision) to match the
+# panel's current pin, so both apps read the exact same token set.
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.5.0", version = "0.5.0" }
+# Same feature set as the panel's `iced` line, for the same reasons (see
+# saola-panel/Cargo.toml's comment on this line): `tokio` gives the app a
+# runtime the PAM conversation's `spawn_blocking` and (Stage 5) the
+# Open-Meteo fetch both need without spinning up a second executor; `svg` /
+# `image` cover the avatar (config path, `~/.face`, or a raster fallback) and
+# any icon assets the reveal flow needs; `advanced` is carried over for
+# parity with the panel's widget-level access even though Stage 1 doesn't
+# use it yet.
+iced = { version = "0.14", features = ["tokio", "svg", "image", "advanced"] }
+# The waycrate sibling of the panel's `iced_layershell`: binds iced to
+# ext-session-lock-v1 instead of wlr-layer-shell. Same version line (0.19.x)
+# and same upstream repo (waycrate/exwlshelleventloop) as the panel's shell
+# binding, tracking iced 0.14.
+iced_sessionlock = "0.19.1"
+chrono = "0.4"
+# Password buffers are zeroed the moment the PAM conversation has consumed
+# them (Architecture: "Password buffers are zeroize'd after the conversation
+# consumes them") — this is the only crate in the tree that does that
+# zeroing; nothing about it is PAM-specific.
+zeroize = "1"
+# PAM. Survey (2026-08-02) of the three live options on crates.io:
+#   - `pam` (1wilkens/pam, MIT/Apache, last published 2023-11-01): dual
+#     permissive license, but two-and-a-half years without a release.
+#   - `pam-client` (cg909/rust-pam-client, MPL-2.0, last published
+#     2022-07-30): the original of the crate below; stale.
+#   - `pam-client2` (LeChatP/rust-pam-client, MPL-2.0, last published
+#     2026-03-27): an actively maintained fork of `pam-client` that fixes
+#     bugs upstream never addressed. Chosen for that activity, plus the
+#     richest API of the three: `Context::new(service, user, conversation)`
+#     drives `authenticate()` / `acct_mgmt()` / `open_session()` against a
+#     user-supplied `ConversationHandler` trait (`prompt_echo_on`,
+#     `prompt_echo_off`, `text_info`, `error_msg`, …) — exactly the
+#     conversation API `auth.rs` needs to feed the reveal flow's password
+#     buffer to PAM without a terminal prompt. MPL-2.0 is file-level
+#     copyleft (modifications to *its* files must stay open) and does not
+#     reach into a crate that merely depends on it, so it's compatible with
+#     this repo staying MIT OR Apache-2.0.
+#
+# `default-features = false` drops the `cli` feature (a `conv_cli`
+# conversation handler that reads/writes a real terminal via `rpassword`) —
+# irrelevant here since `auth.rs` (Stage 4) implements its own
+# `ConversationHandler` that feeds the reveal flow's iced-owned password
+# buffer straight to PAM, never a TTY.
+pam-client2 = { version = "0.5.5", default-features = false }
+# The PAM conversation is a *blocking* C call (`pam_authenticate` can sit on
+# a network module or a hashing round for hundreds of milliseconds), and the
+# lock surface's event loop must never stall on it — Architecture's "the UI
+# thread never blocks" rule. `auth.rs` moves that call onto tokio's blocking
+# pool (`Handle::spawn_blocking`), which is the same runtime iced already
+# spins up for us via its own `tokio` feature (see the `iced` line above) —
+# taking the dependency directly just gives us a name for the runtime handle
+# and a oneshot channel; it does not add a second executor to the process.
+# Features are the minimum for that: `rt` for `runtime::Handle` /
+# `spawn_blocking`, `sync` for the `oneshot` used by the no-runtime fallback
+# path (see `auth.rs`'s `PamAuthenticator::authenticate`).
+tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
+# `getpwuid_r`, for the current user's name and GECOS display name
+# (`auth::Account::current`). Already in the tree via `pam-sys2`; taken
+# directly here because there is no way to ask the C library who we are from
+# `std` alone, and `$USER` is an environment variable a locker should not
+# trust as its only source of identity.
+libc = "0.2"
+# `lockscreen.kdl` (config.rs). Same crate and pinned version as the panel's
+# `panel.kdl` parser, for the same reason (see saola-panel/Cargo.toml): the
+# reference Rust KDL implementation, walked by hand rather than through a
+# serde derive.
+kdl = "6.7.1"
+# Decodes the wallpaper (`src/wallpaper.rs`) to RGBA8 at boot, ourselves,
+# instead of handing `iced::widget::image::Handle::from_path` a raw path.
+# Already in the dependency tree transitively (iced's own `image` feature
+# pulls the same 0.25 line for its wgpu/tiny-skia raster pipelines), so
+# taking it on directly costs nothing extra in the binary — see
+# `src/wallpaper.rs`'s doc comment for why a direct dependency is needed
+# anyway (decoding *before* iced ever sees the handle, not through it).
+# Default features (jpeg/png/webp/gif/... codecs) are already compiled in
+# via iced's own copy, so there's no minimal-features saving available here.
+image = "0.25"
+# Stage 5's Open-Meteo current-temperature fetch (`src/modules/temperature.rs`).
+# Survey (2026-08-02) of the lightweight options, per Architecture's "lightest
+# HTTP path, follow the panel's avoid-heavyweight-deps rule" instruction:
+#   - `reqwest` — the default choice for most apps, but pulls hyper + h2 +
+#     tower's service traits and wants a full-featured tokio (`net`, `time`,
+#     `rt-multi-thread`, …); our tokio dependency today is `rt` + `sync` only
+#     (see the tokio line below) for exactly the PAM `spawn_blocking` case.
+#     Feature-unification would silently grow that surface for one small
+#     periodic GET.
+#   - `minreq` — smaller API, but its `https` feature resolves to rustls with
+#     the `aws-lc-rs` crypto provider, which pulls `aws-lc-sys` and needs
+#     `cmake` (and a C/C++ toolchain) at build time — the same "extra system
+#     build tool" shape as `pam-sys2` needing PAM headers, just for a feature
+#     this crate does not need a second time.
+#   - `ureq` (algesten/ureq) — chosen. Blocking, not async: exactly the shape
+#     `auth.rs` already established for PAM (a blocking call dispatched onto
+#     `tokio::task::spawn_blocking`), so the temperature fetch reuses that
+#     pattern instead of introducing a second concurrency model. Its default
+#     features resolve rustls with the **`ring`** crypto provider (pure Rust,
+#     no `cmake`/C toolchain, unlike `aws-lc-rs`) and `webpki-roots` for
+#     certificate validation (no system CA store dependency). Actively
+#     maintained (3.x, 2026). Default features only — this crate reads the
+#     response body as a plain string and parses it itself (see the
+#     `serde_json` line below), so ureq's own optional `json` feature (a
+#     `read_json::<T>()` convenience built on a `Deserialize` type) is not
+#     needed.
+#
+# Verified with a clean `Cargo.lock` regenerate (`cargo tree -e normal`,
+# 2026-08-02): 15 real new crates enter the *compiled* graph (`ureq`,
+# `ureq-proto`, `rustls`, `rustls-webpki`, `rustls-pki-types`, `ring`,
+# `webpki-roots`, `http`, `httparse`, `getrandom`, `subtle`, `untrusted`,
+# `utf8-zero`, plus `itoa`/`memchr` sharing with what was already there) —
+# `base64`/`percent-encoding`/`flate2`/`log`/`bytes`/`once_cell` were already
+# present. `Cargo.lock` additionally *pins* versions for several of `ureq`'s
+# other optional-feature dependencies this crate does not enable
+# (`cookie_store`, `url`/`idna`, `time`, `serde_json` itself among them,
+# since `cookie_store` also wants it, …) — normal Cargo behaviour for every
+# optional dependency a crate declares, not something this crate actually
+# compiles or links; `cargo tree -e normal` (the activated graph) is the
+# number that matters.
+ureq = "3"
+# Parses the Open-Meteo response (`src/modules/temperature.rs`). Used
+# directly as `serde_json::Value` plus manual `.get("current").get(
+# "temperature_2m")` field lookups, matching this repo's established
+# "walk the parsed document by hand" convention (see the `kdl` line above,
+# and `config.rs`'s own comment on why it does the same for KDL) rather than
+# a `#[derive(serde::Deserialize)]` struct, which would need `serde` itself
+# as a second direct dependency for one two-field response shape. Already
+# resolved transitively at this exact version (`ureq`'s own optional `json`
+# feature depends on it too, though this crate does not enable that
+# feature — see above), so taking it on directly adds only one further new
+# crate to the compiled graph: `zmij` (`serde_json`'s own small integer-
+# formatting helper).
+serde_json = "1"

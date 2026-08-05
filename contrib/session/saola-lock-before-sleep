@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# saola-lock-before-sleep — locks the session before every suspend/hibernate.
+#
+# Stage 6's security review (docs/REVIEW-v0.1.md, finding H-1) found that
+# saola-lockscreen's own startup used to do a synchronous wallpaper decode
+# *before* asking the compositor to lock — a real race against a
+# fire-and-forget "spawn the locker, then suspend" hook. Stage 7 fixed the
+# crate side of that (the decode is now an async Task, see wallpaper.rs and
+# main.rs's Stage 7 doc section), but the session-wiring side still needs
+# its own half of the fix: whatever spawns saola-lockscreen before a
+# suspend must not let the suspend proceed until the locker has at least
+# had a chance to come up. That is what this script is for.
+#
+# It holds a `systemd-inhibit --what=sleep --mode=delay` lock — logind will
+# not actually suspend while that lock is held — for exactly the window
+# between "logind wants to sleep" (the PrepareForSleep(true) signal) and
+# "the locker has been given a moment to start", then lets that particular
+# sleep proceed. It re-arms itself in a loop so every subsequent
+# suspend/resume cycle gets the same protection, for as long as this script
+# (run via the accompanying systemd --user unit) keeps running.
+#
+# # What this can and cannot guarantee (read before trusting it)
+#
+# Per docs/REVIEW-v0.1.md finding L-3: iced_sessionlock discards the
+# ext_session_lock_v1 `locked`/`finished` events, so saola-lockscreen itself
+# has no way to report "the compositor has actually hidden the desktop now"
+# to anything watching it — not to this script, not to any future
+# saola-session package. The GRACE_SECONDS wait below is therefore a coarse
+# proxy, not a confirmation: "the process is still alive N seconds after
+# being spawned", nothing more. It is bounded specifically so a stuck or
+# crashed locker cannot block suspend forever — if saola-lockscreen never
+# comes up at all, this script still lets sleep proceed after the grace
+# period, on the reasoning that a laptop that fails to suspend is its own
+# kind of exposure (battery drain, a bag getting hot) and this crate's
+# actual security boundary is niri's own "a dead lock keeps the session
+# locked until VT switch" fallback (CLAUDE.md), not this script.
+#
+# Installed to ~/.local/bin/saola-lock-before-sleep, run by the systemd
+# --user unit saola-lock-before-sleep.service (this directory) — the same
+# pattern as ~/Developer/system/rosec-vault-return. See this repo's
+# contrib/session/README.md for the exact install commands.
+
+set -euo pipefail
+
+# How long to give saola-lockscreen to start and ask the compositor to lock
+# before this script lets the suspend it is holding back proceed anyway.
+# Generous next to Stage 7's fixed boot() (a config file read only, no image
+# decode — see this file's header comment), tight enough not to noticeably
+# delay a lid-close suspend.
+GRACE_SECONDS=2
+
+lock_the_session() {
+    if pgrep -x saola-lockscreen >/dev/null; then
+        # Already running — a manual lock (Mod+Escape), or a previous cycle
+        # whose locker never exited. Nothing to spawn, nothing to wait for.
+        return
+    fi
+    saola-lockscreen &
+    disown
+    sleep "$GRACE_SECONDS"
+}
+
+# Blocks until exactly one PrepareForSleep(true) signal arrives on the
+# system bus, then returns. `coproc` (not a plain pipe) is what lets this
+# function actually kill `busctl monitor` once it has what it needs —
+# without that, the monitor process would linger as an orphan after every
+# cycle, one more of them per suspend for the life of the session.
+wait_for_prepare_for_sleep() {
+    coproc MONITOR {
+        exec busctl monitor --system --json=short \
+            "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'"
+    }
+    while IFS= read -r -u "${MONITOR[0]}" line; do
+        if jq -e '.payload.data[0] == true' >/dev/null 2>&1 <<<"$line"; then
+            break
+        fi
+    done
+    kill "$MONITOR_PID" 2>/dev/null || true
+    wait "$MONITOR_PID" 2>/dev/null || true
+}
+
+# The single-cycle body, run as `systemd-inhibit`'s child so the *inhibitor
+# itself* is only held for this narrow window — waiting for the next sleep
+# request, then locking — never for the whole time the session is awake
+# (which would just prevent the laptop from ever suspending at all).
+if [[ "${1:-}" == "--once" ]]; then
+    wait_for_prepare_for_sleep
+    lock_the_session
+    exit 0
+fi
+
+while true; do
+    systemd-inhibit --what=sleep --mode=delay \
+        --who="saola-lockscreen" \
+        --why="lock the session before suspend" \
+        "$0" --once
+done

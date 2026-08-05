@@ -1,0 +1,12 @@
+[Unit]
+Description=Lock the Saola session before every suspend/hibernate (docs/REVIEW-v0.1.md H-1)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/saola-lock-before-sleep
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

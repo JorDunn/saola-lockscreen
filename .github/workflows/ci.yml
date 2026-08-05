@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # System libraries the build links against: libpam (auth.rs via pam-sys2 —
+  # pam-client2's FFI layer needs the PAM headers at build time), xkbcommon
+  # (keyboard handling via smithay-client-toolkit, pulled in by
+  # iced_sessionlock's stack), wayland (wayland-sys, same client stack).
+  # Every job that compiles the crate needs these — only fmt gets away
+  # without them. The full set of native links is the `-sys` crates in
+  # Cargo.lock, minus other-platform and pure-FFI ones. (Copied shape from
+  # saola-panel's ci.yml; the set differs — no pulse, no udev, plus PAM.)
+  APT_BUILD_DEPS: libpam0g-dev libxkbcommon-dev libwayland-dev
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  # Both feature configurations are separate compiles (CLAUDE.md: the
+  # dev-unlock cfg branches are invisible to a plain clippy run), so clippy
+  # and test run as a two-entry matrix. dev-unlock never ships — the matrix
+  # exists to keep the nested-niri testing workflow from bitrotting, not to
+  # validate an artifact.
+  clippy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["", "--features dev-unlock"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $APT_BUILD_DEPS
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["", "--features dev-unlock"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $APT_BUILD_DEPS
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test ${{ matrix.features }}
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $APT_BUILD_DEPS
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build
+
+  # Regression test for the M-1 guard (docs/REVIEW-v0.1.md): a release build
+  # with dev-unlock must FAIL at the compile_error! in src/main.rs — that
+  # guard is what keeps the password-free Escape unlock edge out of any
+  # shippable binary (CLAUDE.md's unlock-edge rule). If this job ever goes
+  # red, someone loosened the cfg on the guard; that is a security finding,
+  # not a build problem to "fix" by deleting this job.
+  release-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $APT_BUILD_DEPS
+      - uses: Swatinem/rust-cache@v2
+      - name: Assert release + dev-unlock refuses to compile
+        run: |
+          set +e
+          out=$(cargo check --release --features dev-unlock 2>&1)
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::cargo check --release --features dev-unlock SUCCEEDED — the M-1 compile_error! guard is gone"
+            exit 1
+          fi
+          # Failed as required — but require it failed for the RIGHT reason
+          # (the guard's own message), not some unrelated breakage.
+          echo "$out" | grep -q "must never be compiled into a release build" || {
+            echo "::error::release+dev-unlock failed, but not at the M-1 guard — output follows"
+            echo "$out"
+            exit 1
+          }
