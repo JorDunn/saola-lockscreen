@@ -425,8 +425,10 @@ pub fn load_task(path: PathBuf) -> Pin<Box<dyn Future<Output = Option<Handle>> +
 /// RGBA [`Handle`], or `None` on any decode failure. Split out from [`load`]
 /// so the "garbage bytes" unit test below doesn't need a real file on disk.
 ///
-/// `pub(crate)` since Stage 4: `modules::reveal::load_avatar` decodes the §7
-/// avatar through this same function rather than re-deriving it, because the
+/// `pub(crate)` since Stage 4: `modules::reveal::resolve_avatar` hands this
+/// function to `saola_theme::avatar::Avatar::resolve` as its decoder (the
+/// design-system crate has no `image` dependency and must not grow one)
+/// rather than re-deriving one, because the
 /// `Handle::from_rgba` choice documented above (the one handle variant
 /// `iced_wgpu`'s cache resolves synchronously) matters for the avatar too —
 /// it appears the instant the user interacts, where a frame's delay would

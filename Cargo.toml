@@ -15,9 +15,14 @@ dev-unlock = []
 # `tag` and `version` must move together: `version` names the crate version
 # inside the tagged checkout, and cargo errors loudly if they disagree — see
 # saola-panel's Cargo.toml for the full history of why that's the point, not
-# a nuisance. Pinned to v0.5.0 (PLAN.md Architecture decision) to match the
-# panel's current pin, so both apps read the exact same token set.
-saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.5.0", version = "0.5.0" }
+# a nuisance. Pinned to v0.15.0: that release carries the lock-surface
+# helpers this crate originally grew locally and upstream then adopted
+# (`avatar::{Avatar, Resolution}`, `style::container::disc` / `scrim`,
+# `style::text_input::prompt` / `prompt_rejected`) plus the sizes those
+# helpers need (`avatar_lock`, `field_lock`, `lock_stack_gap`, `ring`,
+# `hairline`). saola-panel still pins v0.5.0 as of 2026-09-06, so the two
+# apps no longer read one token set until the panel bumps too.
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.15.0", version = "0.15.0" }
 # Same feature set as the panel's `iced` line, for the same reasons (see
 # saola-panel/Cargo.toml's comment on this line): `tokio` gives the app a
 # runtime the PAM conversation's `spawn_blocking` and (Stage 5) the

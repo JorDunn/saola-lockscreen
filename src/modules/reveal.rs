@@ -66,7 +66,7 @@
 //!   [`Reveal::update`]'s `Finished` arm closes that door from the other
 //!   side as well.
 //!
-//! # §7 / §6 styling, and the token gaps found while building it
+//! # §7 / §6 styling: everything now comes from `saola-theme`
 //!
 //! §7: avatar (config `avatar`, else `~/.face`, else an initials disc), the
 //! GECOS display name, a password field "styled like the rosec prompt's
@@ -76,40 +76,55 @@
 //! `on_ink.fill_subtle`, `input_text = "#FFFFF0"` is `on_ink.primary`,
 //! `accent_color`/`border_color` are `palette.accent`.
 //!
-//! Every colour below comes from a `saola_theme` token; there is no hex in
-//! this file. Three things this module wanted did **not** exist in
-//! `saola-theme` v0.5.0 and are composed locally from tokens instead — all
-//! three are written up as gaps in this stage's handoff:
+//! This module used to compose three of those looks locally, because
+//! `saola-theme` v0.5.0 had no helper for them: a subtle-fill password
+//! field (`field_style`), an initials disc (`disc_style`), and the §2 awake
+//! scrim (`awake_scrim`). All three were then **ported upstream from this
+//! file** and shipped in `saola-theme` v0.13.0, so the local copies are
+//! gone and this module calls the design system instead:
 //!
-//! - `style::text_input::rest(t, Surface::Ink)` is an *opaque ivory* field
-//!   with ink text (the panel's control-at-rest look), not the rosec
-//!   prompt's subtle-fill-with-ivory-text look §7 asks for. [`field_style`]
-//!   below is that missing variant, built from the same tokens and
-//!   deliberately mirroring the upstream helper's structure — including its
-//!   `rejected` sibling, whose accent-light ring [`field_style`] reproduces
-//!   for the wrong-password state.
-//! - There is no container helper for a *disc* (`radii.pill` at
-//!   `on_ink.fill_subtle`); `style::container::tile` is the same recipe at
-//!   `radii.tile`. [`disc_style`] is the pill-radius version.
-//! - There is no scrim helper. §2's table gives the lock surface a
-//!   `rgba(12,10,0,0.62)` scrim once the prompt is shown, and the token for
-//!   it (`scrim.lock_awake`) exists — only the `container::Style` wrapper
-//!   does not. [`awake_scrim`] is it.
+//! - [`style::text_input::prompt`] / [`style::text_input::prompt_rejected`]
+//!   — the §6 pill over the rosec prompt's quiet `fill_subtle` recess, with
+//!   the accent ring on focus and the accent-light ring in every state once
+//!   a password has been rejected.
+//! - [`style::container::disc`] — `style::container::tile`'s recipe at
+//!   `radii.pill`, which closes a square container into a circle. Used by
+//!   [`saola_theme::avatar::view`], which is itself the port of this
+//!   module's old avatar arm.
+//! - [`style::container::scrim`] with [`style::container::ScrimKind`] —
+//!   `main.rs` layers `ScrimKind::LockAwake` under the prompt and
+//!   `ScrimKind::LockRest` at rest.
 //!
-//! Sizes are the weaker spot: the token set has no avatar diameter and no
-//! lock/greeter field height (§6 names "60–64px on lock/greeter" but §4's
-//! `Sizes` table stops at `hit_target_touch`). Each such value below is
-//! derived from a named token with the derivation spelled out at the use
-//! site, and the gap is listed in the handoff.
+//! The avatar itself moved too: [`saola_theme::avatar::Avatar`] is this
+//! module's old `Avatar` enum, and [`resolve_avatar`] below is the thin
+//! lockscreen-side wrapper that supplies `$HOME`, this crate's decoder
+//! (`wallpaper::decode`) and the stderr warning the design-system crate
+//! deliberately does not emit.
+//!
+//! Sizes are named tokens now as well — `sizes.avatar_lock` (the avatar
+//! circle), `sizes.field_lock` (the §6 60–64 px field height),
+//! `sizes.lock_stack_gap` (the avatar → name → field rhythm) and
+//! `typography.size.avatar_initials` — each minted upstream from the
+//! derivations this file used to spell out at its use sites. There is no
+//! hex and no bare number in this file.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use iced::widget::{column, container, image, text, text_input};
-use iced::{ContentFit, Element, Length, Subscription};
+use iced::widget::text::LineHeight;
+use iced::widget::{column, text, text_input};
+use iced::{Element, Length, Subscription};
 use saola_theme::convert::{ui_font, ui_font_regular, ColorExt};
-use saola_theme::Theme;
+use saola_theme::{style, Surface, Theme};
+
+/// §7's avatar — a decoded photo, or an initials disc. Re-exported rather
+/// than re-declared: this enum *was* this module's, and `saola-theme`
+/// v0.13.0 adopted it verbatim so the future greeter draws the same thing
+/// (see [`saola_theme::avatar`]'s own module docs). `main.rs` keeps
+/// importing it from here, because the lockscreen-side resolution wrapper
+/// ([`resolve_avatar`]) lives here too.
+pub use saola_theme::avatar::Avatar;
 
 use crate::auth::{Account, AuthFuture, Authenticator, Outcome, Password};
 
@@ -233,90 +248,69 @@ pub enum State {
 // Avatar
 // ---------------------------------------------------------------------------
 
-/// §7's avatar, resolved once at boot.
-pub enum Avatar {
-    /// A decoded image: the config `avatar` path, else `~/.face`.
-    Photo(image::Handle),
-    /// The last resort: a disc with the user's initials.
-    Initials(String),
-}
-
-impl Avatar {
-    /// Resolve the avatar per §7's order: config override, then `~/.face`,
-    /// then an initials disc. Called once, from `main.rs`'s
-    /// `Lockscreen::boot` (which is also where the config lives — see the
-    /// Stage 3 handoff's "read the config once" gotcha).
-    ///
-    /// Never fails: an unreadable or undecodable candidate falls through to
-    /// the next one, and the initials disc always works.
-    pub fn resolve(configured: Option<&Path>, account: &Account) -> Self {
-        for candidate in avatar_candidates(configured, std::env::var_os("HOME").map(PathBuf::from))
-        {
-            match load_avatar(&candidate) {
-                Some(handle) => return Avatar::Photo(handle),
-                None => {
-                    // Only worth a warning when the user asked for this
-                    // specific file; a missing `~/.face` is the normal case
-                    // for most systems and says nothing.
-                    if Some(candidate.as_path()) == configured {
-                        eprintln!(
-                            "saola-lockscreen: avatar {} could not be loaded — falling back",
-                            candidate.display()
-                        );
-                    }
-                }
-            }
-        }
-        Avatar::Initials(initials_from(&account.display_name))
-    }
-}
-
-/// The ordered avatar candidates. Pure function of its inputs (`$HOME` is a
-/// parameter, not an environment read) so the §7 precedence is unit-testable
-/// without touching the filesystem — the same discipline `config.rs`'s
-/// `config_dir_from` uses.
-fn avatar_candidates(configured: Option<&Path>, home: Option<PathBuf>) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(path) = configured {
-        candidates.push(path.to_path_buf());
-    }
-    if let Some(home) = home {
-        candidates.push(home.join(".face"));
-    }
-    candidates
-}
-
-/// Read and decode one avatar candidate, or `None`.
+/// Resolve §7's avatar for `account`, once, at boot — called from
+/// `main.rs`'s `Lockscreen::boot` (which is also where the config lives —
+/// see the Stage 3 handoff's "read the config once" gotcha).
 ///
-/// Shares `wallpaper::decode` rather than re-deriving it: that function's
-/// `Handle::from_rgba` output is the one handle variant `iced_wgpu`'s cache
-/// resolves synchronously (see `wallpaper.rs`'s doc comment for the full,
-/// live-confirmed account), which matters even more here than for the
-/// wallpaper — the avatar appears at the exact moment the user interacts,
-/// and a one-frame-late avatar would be visible as a flash.
-fn load_avatar(path: &Path) -> Option<image::Handle> {
-    let bytes = std::fs::read(path).ok()?;
-    crate::wallpaper::decode(&bytes)
+/// A three-line wrapper over [`Avatar::resolve`], which is this module's own
+/// former `resolve` after `saola-theme` v0.13.0 adopted it. The wrapper
+/// exists because the design-system crate deliberately keeps three things
+/// out of itself, and all three are the lockscreen's to supply:
+///
+/// 1. **`$HOME`.** The theme takes it as a parameter so its own precedence
+///    tests never touch the environment; the read belongs to the app.
+/// 2. **The decoder.** `saola-theme` has no `image` dependency and must not
+///    grow one. `wallpaper::decode` is shared here rather than re-derived
+///    because its `Handle::from_rgba` output is the one handle variant
+///    `iced_wgpu`'s cache resolves *synchronously* (see `wallpaper.rs`'s
+///    doc comment for the live-confirmed account), which matters even more
+///    for the avatar than for the wallpaper: it appears at the exact moment
+///    the user interacts, and a one-frame-late avatar reads as a flash.
+/// 3. **The warning.** [`saola_theme::avatar::Resolution`] returns the
+///    "configured path failed" case as *data* rather than writing to
+///    anyone's stderr; printing it is this binary's job.
+///
+/// Never fails: an unreadable, oversize, non-regular-file or undecodable
+/// candidate falls through to the next one, and the initials disc always
+/// works.
+pub fn resolve_avatar(configured: Option<&Path>, account: &Account) -> Avatar {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_avatar_from(configured, &account.display_name, home.as_deref())
 }
 
-/// Up to two initials from a display name, uppercased.
-///
-/// `"Jordan Dunn"` → `"JD"`; `"jordan"` → `"J"`; an empty or symbol-only
-/// name → `"?"`, because §7 wants a disc with *something* in it and a blank
-/// disc reads as a rendering bug. Pure, and unit-tested below.
-fn initials_from(display_name: &str) -> String {
-    let initials: String = display_name
-        .split_whitespace()
-        .filter_map(|word| word.chars().next())
-        .filter(|c| c.is_alphanumeric())
-        .take(2)
-        .collect();
+/// [`resolve_avatar`] with `$HOME` injected instead of read, so the §7
+/// precedence stays unit-testable without touching the environment — the
+/// same discipline `config.rs`'s `config_dir_from` uses.
+fn resolve_avatar_from(
+    configured: Option<&Path>,
+    display_name: &str,
+    home: Option<&Path>,
+) -> Avatar {
+    // `MAX_BYTES_DEFAULT` (16 MiB) is the theme's recommended cap and this
+    // crate has no stronger opinion: `wallpaper.rs`'s own limit is
+    // `MAX_DIMENSION`, a *pixel* cap applied after decoding, so there is no
+    // existing byte budget for an avatar to agree with. The cap matters
+    // because every candidate path is user-controlled and read before the
+    // user has authenticated — see `saola_theme::avatar`'s "Bounded read".
+    let resolution = Avatar::resolve(
+        configured,
+        display_name,
+        home,
+        Avatar::MAX_BYTES_DEFAULT,
+        crate::wallpaper::decode,
+    );
 
-    if initials.is_empty() {
-        "?".to_string()
-    } else {
-        initials.to_uppercase()
+    // Only the *explicitly configured* path is worth a warning; a missing
+    // `~/.face` is the normal case for most systems and says nothing. The
+    // theme applies exactly that rule when it sets the flag.
+    if let Some(path) = resolution.configured_failed {
+        eprintln!(
+            "saola-lockscreen: avatar {} could not be loaded — falling back",
+            path.display()
+        );
     }
+
+    resolution.avatar
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +361,8 @@ impl Reveal {
     }
 
     /// Whether the prompt is showing. `main.rs` uses this to decide whether
-    /// to draw the reveal stack and the §2 `lock_awake` scrim at all — at
+    /// to draw the reveal stack at all, and which of §2's two lock scrims to
+    /// lay over the wallpaper (`LockAwake` here, `LockRest` at rest) — at
     /// rest, §7 says the surface shows the clock, date and temperature and
     /// *nothing else*.
     pub fn is_awake(&self) -> bool {
@@ -544,47 +539,13 @@ impl Reveal {
     /// error line when there is one. `main.rs` only calls this when
     /// [`Self::is_awake`]; at rest there is nothing here to draw.
     pub fn view(&self, theme: &Theme) -> Element<'_, Message> {
-        // Size derivations (see this module's doc comment on the token
-        // gaps). `hit_target_touch` is §4's "Hit target, minimum: 44px
-        // (touch and lock/greeter)" — the only size token the style guide
-        // scopes to this surface — so the avatar is stated as two of them
-        // rather than as a number of its own.
-        let avatar_size = theme.sizes.hit_target_touch * 2.0;
-
-        let avatar: Element<'_, Message> = match &self.avatar {
-            Avatar::Photo(handle) => image(handle.clone())
-                .width(avatar_size)
-                .height(avatar_size)
-                // Cover-fit crops a non-square photo to the square slot
-                // rather than distorting it. Note it is *not* clipped to a
-                // circle: iced 0.14 has no way to clip a raster image to a
-                // rounded rect (a container's border radius does not clip
-                // its children), so a photo avatar is square while the
-                // initials fallback below is a true disc. Flagged in the
-                // handoff.
-                .content_fit(ContentFit::Cover)
-                .into(),
-            Avatar::Initials(initials) => container(
-                text(initials)
-                    .font(ui_font(theme))
-                    // The initials are the largest thing in the disc, so
-                    // they take the same size the name below uses — §3 has
-                    // no "avatar initials" row to defer to.
-                    .size(theme.typography.size.launcher_input)
-                    .color(theme.on_ink.primary.into_iced()),
-            )
-            // `center_x`/`center_y` take the *length* to centre within, and
-            // set it — passing `Fill` here (the obvious-looking spelling)
-            // silently overrides the `.width`/`.height` above and grows the
-            // disc to the whole surface. Found live in the nested-niri
-            // smoke test for this stage; the fix is to centre within the
-            // avatar's own size, which is also why there is no separate
-            // `.width`/`.height` call.
-            .center_x(avatar_size)
-            .center_y(avatar_size)
-            .style(disc_style(theme))
-            .into(),
-        };
+        // The whole avatar arm — photo cover-fit, initials on a
+        // `container::disc`, the `center_x`/`center_y`-not-`Fill` gotcha —
+        // now lives in `saola_theme::avatar::view`, ported from this file so
+        // the greeter draws an identical badge. `sizes.avatar_lock` (88) is
+        // the token minted for the diameter this module used to state as
+        // `hit_target_touch * 2.0`.
+        let avatar = saola_theme::avatar::view(theme, &self.avatar, theme.sizes.avatar_lock);
 
         // §3: "IBM Plex Sans — all interface text. Everything you scan."
         // The clock and date above are already the screen's two permitted
@@ -608,12 +569,8 @@ impl Reveal {
             .id(password_input_id())
             .secure(true)
             .font(ui_font_regular(theme))
-            // §6's lock/greeter field is 60–64px tall; there is no token for
-            // that height, so it is composed from the two tokens that do
-            // exist — the launcher's input type size and the popover's
-            // content padding — which lands in the same range.
             .size(theme.typography.size.launcher_input)
-            .padding(theme.sizes.popover_padding)
+            .padding(field_padding(theme))
             .width(Length::Fixed(theme.sizes.popover_width))
             .style(field_style(theme, self.error.is_some()))
             .on_input_maybe(accepting_input.then_some(|value: String| {
@@ -627,7 +584,12 @@ impl Reveal {
 
         let mut stack = column![avatar, name, field]
             .align_x(iced::Center)
-            .spacing(theme.sizes.island_gap);
+            // `lock_stack_gap` (20) is the token minted for exactly this
+            // rhythm (avatar → name → field). This module used to borrow
+            // `island_gap` (10), which names the gap between free-standing
+            // panel islands — a different concept that merely had a
+            // plausible number.
+            .spacing(theme.sizes.lock_stack_gap);
 
         if let Some(error) = &self.error {
             // §1: "accent-light — accent-coloured text on ink only (hints,
@@ -684,126 +646,63 @@ pub fn event_to_message(event: &iced::Event) -> Option<Message> {
 }
 
 // ---------------------------------------------------------------------------
-// Styles composed from tokens (see the module doc comment's gap list)
+// Size derivations the design system cannot express for us
 // ---------------------------------------------------------------------------
 
-/// The §2 "Lock / greeter awake (prompt shown)" scrim: `scrim.lock_awake`,
-/// edge to edge, no rounding. The token exists in `saola-tokens`; only the
-/// `container::Style` wrapper is missing from `saola-theme`, so this is the
-/// wrapper and not a new colour.
-pub fn awake_scrim(theme: &Theme) -> impl Fn(&iced::Theme) -> container::Style {
-    let scrim = theme.scrim.lock_awake.into_iced();
-    let text_color = theme.on_ink.primary.into_iced();
-    move |_| container::Style {
-        text_color: Some(text_color),
-        background: Some(iced::Background::Color(scrim)),
-        border: iced::Border {
-            color: iced::Color::TRANSPARENT,
-            width: 0.0,
-            radius: 0.0.into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-/// The initials disc: `style::container::tile`'s recipe (subtle fill on a
-/// shell surface, reading as a recess rather than a floating layer) at
-/// `radii.pill` instead of `radii.tile`, which makes it a circle when the
-/// container is square.
-fn disc_style(theme: &Theme) -> impl Fn(&iced::Theme) -> container::Style {
-    let fill = theme.on_ink.fill_subtle.into_iced();
-    let text_color = theme.on_ink.primary.into_iced();
-    let radius = theme.radii.pill;
-    move |_| container::Style {
-        text_color: Some(text_color),
-        background: Some(iced::Background::Color(fill)),
-        border: iced::Border {
-            color: iced::Color::TRANSPARENT,
-            width: 0.0,
-            radius: radius.into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-/// The password field — §6's pill, in the rosec prompt's colours.
+/// Vertical padding that makes the password field `sizes.field_lock` tall.
 ///
-/// Structurally a copy of `saola_theme::style::text_input::rest` /
-/// `::rejected` with one substitution: the resting fill is
-/// `on_ink.fill_subtle` with `on_ink.primary` text (the rosec prompt's
-/// `input_background` / `input_text`, and §7's own wording) instead of the
-/// upstream helper's opaque ivory with ink text. Focus is still the 2 px
-/// `palette.accent` ring; `rejected` still swaps that ring for
-/// `palette.accent_light` in every status, so a wrong password is legible as
-/// such even while the field is focused.
+/// `sizes.field_lock` (62) is the token for §6's "60–64px on lock/greeter"
+/// field, and `style::text_input::prompt`'s own docs name it as the height
+/// to pair the style with. iced 0.14's `text_input` has **no `.height`**,
+/// though: its height is the value text's line height plus the vertical
+/// padding, and nothing else (read out of `iced_widget-0.14.2`'s
+/// `text_input::layout`, which computes
+/// `line_height.to_absolute(text_size)` and then shrinks the limits by the
+/// padding). So the only way to *adopt* the token rather than approximate
+/// it is to solve for the padding that produces it.
+///
+/// The horizontal padding stays `sizes.popover_padding` — §6's content
+/// padding, and what this field has always used.
+///
+/// `max(0.0)` guards the case where a future type token grows past the
+/// field height: a negative padding is not a panic in iced, but it is a
+/// nonsense layout, and this module has no runtime `panic!` budget to spend
+/// on finding out.
+fn field_padding(theme: &Theme) -> iced::Padding {
+    let text_size = theme.typography.size.launcher_input;
+    // `LineHeight::default()` is what `text_input` uses when the caller sets
+    // none — the same default this widget is already getting.
+    let line_height = LineHeight::default().to_absolute(text_size.into()).0;
+    let vertical = ((theme.sizes.field_lock - line_height) / 2.0).max(0.0);
+
+    iced::Padding::default()
+        .top(vertical)
+        .bottom(vertical)
+        .left(theme.sizes.popover_padding)
+        .right(theme.sizes.popover_padding)
+}
+
+/// The password field's style: `style::text_input::prompt`, or its
+/// `prompt_rejected` sibling once an attempt has been refused.
+///
+/// A closure rather than a straight `if` at the call site because the two
+/// helpers return *different* opaque types: they are only interchangeable
+/// once both are called, which is what this wrapper arranges. Both are this
+/// module's former `field_style`, ported into `saola-theme` v0.13.0 —
+/// `prompt_rejected` draws the accent-light ring in every interactive
+/// status, so a wrong password keeps saying so while the user retypes.
 fn field_style(
     theme: &Theme,
     rejected: bool,
 ) -> impl Fn(&iced::Theme, text_input::Status) -> text_input::Style {
-    let radius = theme.radii.pill;
-    let background = theme.on_ink.fill_subtle.into_iced();
-    let value = theme.on_ink.primary.into_iced();
-    let placeholder = theme.on_ink.quaternary.into_iced();
-    let icon = theme.on_ink.secondary.into_iced();
-    let divider = theme.on_ink.divider.into_iced();
-    let disabled_text = theme.on_ink.disabled.into_iced();
-    let accent = theme.palette.accent.into_iced();
-    // §1: accent-light is accent-coloured text *on ink*; the upstream
-    // `rejected` helper uses it for the ring for the same reason.
-    let tint = theme.palette.accent_light.into_iced();
+    let prompt = style::text_input::prompt(theme, Surface::Ink);
+    let prompt_rejected = style::text_input::prompt_rejected(theme, Surface::Ink);
 
-    move |_, status| {
-        let border = |color: iced::Color, width: f32| iced::Border {
-            color,
-            width,
-            radius: radius.into(),
-        };
-        // In the rejected state the ring is drawn in every status, so the
-        // field keeps saying "that was wrong" while the user retypes.
-        let ring = |fallback_color: iced::Color, fallback_width: f32| {
-            if rejected {
-                border(tint, 2.0)
-            } else {
-                border(fallback_color, fallback_width)
-            }
-        };
-
-        match status {
-            text_input::Status::Active => text_input::Style {
-                background: iced::Background::Color(background),
-                border: ring(iced::Color::TRANSPARENT, 0.0),
-                icon,
-                placeholder,
-                value,
-                selection: accent,
-            },
-            text_input::Status::Hovered => text_input::Style {
-                background: iced::Background::Color(background),
-                border: ring(divider, 1.0),
-                icon,
-                placeholder,
-                value,
-                selection: accent,
-            },
-            text_input::Status::Focused { .. } => text_input::Style {
-                background: iced::Background::Color(background),
-                border: ring(accent, 2.0),
-                icon,
-                placeholder,
-                value,
-                selection: accent,
-            },
-            // `Authenticating`. The fill stays put so the field does not
-            // visibly jump while PAM works; only the text drops to the
-            // disabled step.
-            text_input::Status::Disabled => text_input::Style {
-                background: iced::Background::Color(background),
-                border: border(iced::Color::TRANSPARENT, 0.0),
-                icon: disabled_text,
-                placeholder: disabled_text,
-                value: disabled_text,
-                selection: accent,
-            },
+    move |iced_theme, status| {
+        if rejected {
+            prompt_rejected(iced_theme, status)
+        } else {
+            prompt(iced_theme, status)
         }
     }
 }
@@ -1374,49 +1273,76 @@ mod tests {
     }
 
     // ---- Avatar ----------------------------------------------------------
+    //
+    // The candidate ordering, the initials rules and the
+    // configured-path-failed flag are `saola-theme`'s tests now (they were
+    // ported from this file along with the code, and
+    // `saola_theme::avatar`'s own test module asserts the same cases
+    // verbatim). What is still this crate's to prove is the *wiring* of
+    // `resolve_avatar_from`: that it passes `$HOME` through, that a bad
+    // configured path still falls through rather than failing, and that the
+    // initials it lands on are the account's.
 
-    /// §7's precedence: the config override first, then `~/.face`.
+    /// §7's last resort, reached through this crate's wrapper: no `$HOME`
+    /// and an unreadable configured path leaves an initials disc, not a
+    /// panic and not a blank.
     #[test]
-    fn avatar_candidates_are_config_then_dot_face() {
-        let configured = PathBuf::from("/opt/avatars/jordan.png");
-        let candidates = avatar_candidates(Some(&configured), Some(PathBuf::from("/home/jordan")));
-        assert_eq!(
-            candidates,
-            vec![configured, PathBuf::from("/home/jordan/.face")]
+    fn a_bad_configured_path_falls_through_to_initials() {
+        let configured = PathBuf::from("/nonexistent/avatar.png");
+        let avatar = resolve_avatar_from(Some(&configured), "Jordan Dunn", None);
+        assert!(matches!(avatar, Avatar::Initials(ref i) if i == "JD"));
+    }
+
+    /// `$HOME` reaches the theme's candidate list: a home directory that
+    /// does not exist contributes a `~/.face` candidate that fails, and the
+    /// resolution still ends on the initials disc rather than erroring.
+    #[test]
+    fn a_missing_dot_face_still_resolves() {
+        let avatar = resolve_avatar_from(None, "jordan", Some(Path::new("/nonexistent-home")));
+        assert!(matches!(avatar, Avatar::Initials(ref i) if i == "J"));
+    }
+
+    /// A display name with nothing alphanumeric in it still produces a
+    /// legible disc rather than an empty one — the case §7 cares about, kept
+    /// here because it is the lockscreen's GECOS field that can be blank.
+    #[test]
+    fn a_blank_display_name_still_produces_a_disc() {
+        let avatar = resolve_avatar_from(None, "-- --", None);
+        assert!(matches!(avatar, Avatar::Initials(ref i) if i == "?"));
+    }
+
+    // ---- Size derivations ------------------------------------------------
+
+    /// The one place this module still computes a size rather than naming a
+    /// token: [`field_padding`] exists only to make the field come out
+    /// `sizes.field_lock` tall, because iced 0.14's `text_input` has no
+    /// `.height`. If that arithmetic drifts, §6's "60–64px on lock/greeter"
+    /// silently stops holding — so it is asserted rather than trusted.
+    #[test]
+    fn the_password_field_is_field_lock_tall() {
+        let theme = Theme::saola();
+        let padding = field_padding(&theme);
+        let line_height = LineHeight::default()
+            .to_absolute(theme.typography.size.launcher_input.into())
+            .0;
+
+        let height = line_height + padding.top + padding.bottom;
+        assert!(
+            (height - theme.sizes.field_lock).abs() < 0.01,
+            "field is {height}px tall, expected sizes.field_lock ({})",
+            theme.sizes.field_lock
         );
     }
 
+    /// The horizontal half of the same padding is §6's content padding,
+    /// untouched by the height solve above.
     #[test]
-    fn avatar_candidates_without_config_are_just_dot_face() {
-        let candidates = avatar_candidates(None, Some(PathBuf::from("/home/jordan")));
-        assert_eq!(candidates, vec![PathBuf::from("/home/jordan/.face")]);
-    }
+    fn the_password_field_keeps_popover_padding_horizontally() {
+        let theme = Theme::saola();
+        let padding = field_padding(&theme);
 
-    /// No config path and no `$HOME`: nothing to try, so the initials disc
-    /// is the answer. Must not panic and must not invent a path.
-    #[test]
-    fn avatar_candidates_can_be_empty() {
-        assert!(avatar_candidates(None, None).is_empty());
-    }
-
-    #[test]
-    fn initials_take_the_first_two_words() {
-        assert_eq!(initials_from("Jordan Dunn"), "JD");
-        assert_eq!(initials_from("Jordan Michael Dunn"), "JM");
-    }
-
-    #[test]
-    fn initials_from_a_single_word() {
-        assert_eq!(initials_from("jordan"), "J");
-    }
-
-    /// A name with nothing alphanumeric in it still produces a legible disc
-    /// rather than an empty one.
-    #[test]
-    fn initials_fall_back_to_a_question_mark() {
-        assert_eq!(initials_from(""), "?");
-        assert_eq!(initials_from("   "), "?");
-        assert_eq!(initials_from("-- --"), "?");
+        assert_eq!(padding.left, theme.sizes.popover_padding);
+        assert_eq!(padding.right, theme.sizes.popover_padding);
     }
 
     // ---- Message hygiene -------------------------------------------------

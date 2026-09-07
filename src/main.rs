@@ -245,11 +245,14 @@
 //! the complete list: the `TryInto` interception arm, this arm, and the
 //! `#[cfg(feature = "dev-unlock")]` arm below.
 //!
-//! **Layering.** `view` gains one conditional layer and one conditional
-//! sibling. Between the wallpaper and the centred content there is now the
-//! style guide §2 scrim for "Lock / greeter awake (prompt shown)"
-//! (`scrim.lock_awake`), pushed only while the prompt is up — at rest §7
-//! wants the wallpaper at full strength with nothing over it. The reveal
+//! **Layering.** `view` gains one layer and one conditional sibling.
+//! Between the wallpaper and the centred content there is now a style guide
+//! §2 scrim, always present and switching kind with the state: the
+//! `scrim.lock_rest` gradient for "Lock / greeter at rest", and the flat
+//! `scrim.lock_awake` for "Lock / greeter awake (prompt shown)". (Until the
+//! saola-theme v0.14.0 bump this crate drew the awake scrim only and left
+//! the wallpaper untreated at rest — §2's table always specified both; the
+//! rest entry is a gradient and there was no helper for one.) The reveal
 //! stack itself is pushed into the same centred `column!` the clock lives
 //! in, below the date, which is also where Stage 5's temperature line goes.
 //!
@@ -305,7 +308,7 @@
 //! lands via the new `Message::WallpaperLoaded` arm below. See
 //! `wallpaper::load_task`'s doc comment for the dispatch pattern (copied from
 //! `auth::PamAuthenticator::authenticate`) and this file's `Message` doc
-//! comment for the hand-written `Debug` this required. `Avatar::resolve` and
+//! comment for the hand-written `Debug` this required. The avatar resolve and
 //! `Account::current` stay synchronous and in `boot`, deliberately — the
 //! review considered moving them too and accepted leaving them (an avatar
 //! file is small; `Account::current`'s NSS call is instant on this machine's
@@ -338,7 +341,7 @@ use iced_sessionlock::application;
 use iced_sessionlock::to_session_message;
 use saola_theme::{style, to_iced_theme, Theme};
 
-use modules::reveal::{Avatar, Effect, Reveal};
+use modules::reveal::{Effect, Reveal};
 use modules::temperature::{Coordinates, Temperature};
 
 // M-1 (docs/REVIEW-v0.1.md, must-fix): nothing in the type system stopped
@@ -449,7 +452,7 @@ impl Lockscreen {
         let config = config::LockscreenConfig::load();
 
         let account = auth::Account::current();
-        let avatar = Avatar::resolve(config.avatar.as_deref(), &account);
+        let avatar = modules::reveal::resolve_avatar(config.avatar.as_deref(), &account);
         // The real authenticator. Behind an `Arc<dyn Authenticator>` so
         // `modules::reveal`'s tests can put a fake in its place — the whole
         // reason `auth.rs` defines a trait (Architecture's testing
@@ -613,9 +616,9 @@ impl Lockscreen {
     /// `sessionlockev` guarantees that without any surface bookkeeping
     /// here). See this file's module doc comment's "Stage 3" section for
     /// the full layering story; in short: ink base, optional cover-fit
-    /// wallpaper, then the centred clock/date on top, `Fill`/`Fill` at
-    /// every layer so each covers the whole output regardless of that
-    /// output's resolution or scale.
+    /// wallpaper, the §2 scrim for the current state, then the centred
+    /// clock/date on top, `Fill`/`Fill` at every layer so each covers the
+    /// whole output regardless of that output's resolution or scale.
     ///
     /// Teaching note (kept from Stage 2, still true): the ink layer is
     /// painted explicitly rather than leaning on the fact that
@@ -667,20 +670,37 @@ impl Lockscreen {
                     .content_fit(ContentFit::Cover),
             );
         }
-        if self.reveal.is_awake() {
-            // Style guide §2's scrim table: "Lock / greeter awake (prompt
-            // shown) — rgba(12,10,0,0.62)", i.e. the `scrim.lock_awake`
-            // token. It sits above the wallpaper and below the content, so
-            // the clock and the prompt both read against a dimmed image
-            // rather than against whatever the wallpaper happens to be.
-            // At rest there is no scrim: §7 wants the wallpaper itself.
-            layers = layers.push(
-                container(Space::new().width(Fill).height(Fill))
-                    .width(Fill)
-                    .height(Fill)
-                    .style(modules::reveal::awake_scrim(&self.theme)),
-            );
-        }
+        // Style guide §2's scrim table gives the lock surface *two* entries,
+        // and the surface is always in one of them — so there is always a
+        // scrim, only its kind changes:
+        //
+        // - At rest: "Lock / greeter at rest", the one gradient scrim in the
+        //   system (`ScrimKind::LockRest` / the `scrim.lock_rest` token) —
+        //   ink at .18 down the top edge, nearly clear (.02) at 34% where
+        //   the clock sits, ink at .34 along the bottom. It keeps the clock
+        //   legible over a bright wallpaper without hiding the image, which
+        //   is why §7's "clock, date, temperature centred, nothing else" is
+        //   about *content*, not about leaving the wallpaper untreated.
+        // - Awake: "Lock / greeter awake (prompt shown)", the flat
+        //   rgba(12,10,0,0.62) `ScrimKind::LockAwake`.
+        //
+        // Either way it sits above the wallpaper and below the content, so
+        // the clock and the prompt both read against a treated image rather
+        // than against whatever the wallpaper happens to be. Both are the
+        // `saola_theme` helper now; this crate's local `awake_scrim` was
+        // ported upstream in saola-theme v0.13.0.
+        let scrim = if self.reveal.is_awake() {
+            style::container::ScrimKind::LockAwake
+        } else {
+            style::container::ScrimKind::LockRest
+        };
+        layers = layers.push(
+            container(Space::new().width(Fill).height(Fill))
+                .width(Fill)
+                .height(Fill)
+                .style(style::container::scrim(&self.theme, scrim)),
+        );
+
         layers.push(centred).into()
     }
 

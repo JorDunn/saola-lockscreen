@@ -1,0 +1,50 @@
+# ASD-STE100 project glossary for ste100 check (see the global CLAUDE.md).
+# Technical Names used in this repo's commit messages and documentation.
+name: saola-lockscreen
+technical_nouns:
+  - feat
+  - fix
+  - saola
+  - saola-theme
+  - saola-panel
+  - saola-lockscreen
+  - saola_theme::avatar
+  - Avatar::MAX_BYTES_DEFAULT
+  - avatar
+  - avatar_lock
+  - field_lock
+  - lock_stack_gap
+  - crate
+  - theme
+  - token
+  - tokens
+  - pin
+  - scrim
+  - disc
+  - prompt
+  - text
+  - field
+  - lock
+  - design
+  - greeter
+  - notification
+  - wrapper
+  - decoder
+  - image
+  - file
+  - user
+  - warning
+  - message
+  - size
+  - style
+  - guide
+  - iced
+  - padding
+  - px
+  - version
+  - $HOME
+technical_verbs:
+  - authenticate
+  - decode
+  - unlock
+  - lock

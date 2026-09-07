@@ -185,8 +185,14 @@ kill %1   # or: pkill -f 'niri -c /tmp/nested-niri.kdl'
 ## Conventions
 
 - The `saola-theme` dependency is pinned to a release tag (currently
-  `tag = "saola-theme-v0.5.0"`, with a matching `version`, matching the panel's current
-  pin). Bumping it is a deliberate, reviewed change — never switch to `branch = "main"`.
+  `tag = "saola-theme-v0.15.0"`, with a matching `version`). Bumping it is a deliberate,
+  reviewed change — never switch to `branch = "main"`. The lock-surface helpers and size
+  tokens that were ported upstream *from this crate* (`avatar::{Avatar, view}`,
+  `container::disc`/`scrim`, `text_input::prompt`, plus
+  `sizes.avatar_lock`/`field_lock`/`lock_stack_gap`) arrived at v0.13.0/v0.14.0; v0.15.0
+  is additive only (`avatar::placeholder`, `sizes.avatar_glyph`, for the greeter), and
+  this crate does not use the new API. saola-panel still pins v0.5.0 as of 2026-09-06,
+  so the two apps no longer read one token set until the panel bumps.
 - **PAM crate: `pam-client2`.** Survey (2026-08-02) of the three live options on
   crates.io:
   - `pam` (1wilkens/pam, MIT/Apache dual license) — last published 2023-11-01.
