@@ -39,7 +39,7 @@ layout:
 ```
 src/
 ├── main.rs                 # SessionLock app: state machine, update/view wiring
-├── config.rs                # lockscreen.kdl: wallpaper, lat/lon, avatar override
+├── config.rs                # lockscreen.toml: wallpaper, lat/lon, avatar override
 ├── auth.rs                  # Authenticator trait + PAM impl (a future greeter reuses this)
 └── modules/
     ├── mod.rs
@@ -233,7 +233,7 @@ kill %1   # or: pkill -f 'niri -c /tmp/nested-niri.kdl'
   Response parsing uses `serde_json::Value` with manual `.get(...)` field lookups
   (see `modules/temperature.rs`'s `parse_temperature`) rather than a
   `#[derive(serde::Deserialize)]` struct — the same "walk the parsed document by
-  hand" choice `config.rs` makes for KDL, and it avoids a second direct dependency
+  hand" choice `config.rs` makes for TOML, and it avoids a second direct dependency
   (`serde` itself, for the derive macro) for a two-field response shape.
   `cargo tree -e normal` (the activated dependency graph, verified 2026-08-02): 15
   real new crates beyond what was already in the tree (`ureq`, `ureq-proto`,

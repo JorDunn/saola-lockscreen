@@ -94,7 +94,7 @@ Architecture's design (this crate stays focused on the lock surface itself).
 
 ## Configuring it
 
-`~/.config/saola/lockscreen.kdl`, entirely optional — every knob has a built-in
+`~/.config/saola/lockscreen.toml`, entirely optional — every knob has a built-in
 default, and the file is read once at startup (no live reload; a locker's whole job is
 coming up correctly and staying that way, not watching a config file mid-lock). The
 directory resolves most-specific-first, the same chain `saola-panel`'s `panel.kdl`
@@ -107,28 +107,27 @@ terminal to read flags from):
 
 An env var set to the empty string counts as unset, per the XDG spec's own rule.
 
-```kdl
-lockscreen {
-    wallpaper "~/Pictures/wallpaper.png"
-    latitude 51.5074
-    longitude -0.1278
-    avatar "~/Pictures/me.png"
-}
+```toml
+wallpaper = "~/Pictures/wallpaper.png"
+latitude = 51.5074
+longitude = -0.1278
+avatar = "~/Pictures/me.png"
 ```
 
 | Knob | Default | Notes |
 |---|---|---|
-| `wallpaper "path"` | none — ink | §7's wallpaper ground, cover-fit. Falls back to the theme's ink surface on any unset/unreadable/undecodable path — never an error state. `~/`-prefixed paths expand against `$HOME`. |
-| `latitude` / `longitude` | none | Feeds the Open-Meteo outdoor-temperature fetch (see [Privacy](#privacy--known-limitations) below). Both must be set together — a lone one is treated as neither. Either a KDL integer or a float. |
-| `avatar "path"` | none | Overrides the reveal flow's avatar. Falls back to `~/.face`, then an initials disc built from your account's GECOS display name (or login name if GECOS is empty). `~/`-prefixed paths expand against `$HOME`. |
+| `wallpaper = "path"` | none — ink | §7's wallpaper ground, cover-fit. Falls back to the theme's ink surface on any unset/unreadable/undecodable path — never an error state. `~/`-prefixed paths expand against `$HOME`. |
+| `latitude` / `longitude` | none | Feeds the Open-Meteo outdoor-temperature fetch (see [Privacy](#privacy--known-limitations) below). Both must be set together — a lone one is treated as neither. Give each value as a TOML integer or a float — `inf` and `nan` are rejected. |
+| `avatar = "path"` | none | Overrides the reveal flow's avatar. Falls back to `~/.face`, then an initials disc built from your account's GECOS display name (or login name if GECOS is empty). `~/`-prefixed paths expand against `$HOME`. |
 
 The resilience contract (this crate is stricter than the panel's here — a lockscreen
 bug risks locking you out, not just a cosmetic bar glitch):
 
 | Situation | Result |
 |---|---|
-| No `lockscreen.kdl` at all | Built-in defaults, silent |
-| File present, not valid KDL at all | One `eprintln!` naming the file + the parse error, then the **whole file** falls back to defaults |
+| No `lockscreen.toml` at all | Built-in defaults, silent |
+| No `lockscreen.toml`, but a `lockscreen.kdl` file is found | One `eprintln!` hint naming both files, then built-in defaults |
+| File present, not valid TOML at all | One `eprintln!` naming the file + the parse error, then the **whole file** falls back to defaults |
 | One knob's value is nonsense (a `latitude` that isn't a number, say) | A warning naming that knob; **only that field** defaults, the rest of the document still applies |
 
 ## Behaviour notes

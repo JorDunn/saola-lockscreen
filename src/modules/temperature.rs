@@ -350,9 +350,9 @@ fn fetch_blocking(coordinates: Coordinates) -> Option<f64> {
 /// Walked by hand via [`serde_json::Value`] rather than a
 /// `#[derive(serde::Deserialize)]` struct — see `Cargo.toml`'s comment on
 /// this crate's `serde_json` line, and `config.rs`'s identical choice for
-/// KDL: a two-field response shape does not earn a second direct dependency
-/// (`serde` itself, for the derive macro) on top of the one this already
-/// takes.
+/// TOML: a two-field response shape does not earn a second direct
+/// dependency (`serde` itself, for the derive macro) on top of the one this
+/// already takes.
 fn parse_temperature(body: &str) -> Option<f64> {
     let document: serde_json::Value = serde_json::from_str(body).ok()?;
     let celsius = document.get("current")?.get("temperature_2m")?.as_f64()?;
@@ -377,7 +377,7 @@ mod tests {
         );
     }
 
-    /// Neither knob set — the ordinary "no `lockscreen.kdl` weather config"
+    /// Neither knob set — the ordinary "no `lockscreen.toml` weather config"
     /// case.
     #[test]
     fn neither_coordinate_is_unconfigured() {

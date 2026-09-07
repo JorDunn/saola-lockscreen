@@ -85,11 +85,22 @@ tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
 # `std` alone, and `$USER` is an environment variable a locker should not
 # trust as its only source of identity.
 libc = "0.2"
-# `lockscreen.kdl` (config.rs). Same crate and pinned version as the panel's
-# `panel.kdl` parser, for the same reason (see saola-panel/Cargo.toml): the
-# reference Rust KDL implementation, walked by hand rather than through a
-# serde derive.
-kdl = "6.7.1"
+# `lockscreen.toml` (config.rs). Survey, 2026-09-07 — the KDL → TOML config
+# migration decided with Jordan, matching the family standard saola-greeter
+# and saola-capture already set: TOML parsed by hand over the crate's own
+# loose document type (`toml::Table`, `.get(name)`, `.as_str()`, …), deriving
+# `serde::Deserialize` on nothing of ours, so one bad knob degrades alone
+# with its own named warning instead of failing the whole document the way a
+# one-shot derive error would (this replaces the identical reasoning the old
+# `kdl = "6.7.1"` line above gave for hand-walking KDL). **Pinned at the
+# `0.9` line, not the newer `1.x`**, for the same reason as the greeter's
+# Cargo.toml: `saola-tokens` (via the `saola-theme` dependency above) already
+# depends on `toml = "0.9"` and is compiled into this binary regardless, so
+# matching the line lets Cargo unify onto that one already-resolved crate
+# instead of building a second major version beside it — `cargo tree -i toml`
+# confirms a single `toml v0.9.12` node both before and after this line was
+# added, so it costs zero new crates.
+toml = "0.9"
 # Decodes the wallpaper (`src/wallpaper.rs`) to RGBA8 at boot, ourselves,
 # instead of handing `iced::widget::image::Handle::from_path` a raw path.
 # Already in the dependency tree transitively (iced's own `image` feature
@@ -144,8 +155,8 @@ ureq = "3"
 # Parses the Open-Meteo response (`src/modules/temperature.rs`). Used
 # directly as `serde_json::Value` plus manual `.get("current").get(
 # "temperature_2m")` field lookups, matching this repo's established
-# "walk the parsed document by hand" convention (see the `kdl` line above,
-# and `config.rs`'s own comment on why it does the same for KDL) rather than
+# "walk the parsed document by hand" convention (see the `toml` line above,
+# and `config.rs`'s own comment on why it does the same for TOML) rather than
 # a `#[derive(serde::Deserialize)]` struct, which would need `serde` itself
 # as a second direct dependency for one two-field response shape. Already
 # resolved transitively at this exact version (`ureq`'s own optional `json`
