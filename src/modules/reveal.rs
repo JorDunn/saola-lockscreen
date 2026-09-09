@@ -4,7 +4,9 @@
 //! ```text
 //! Idle ──click/keypress──▶ Revealed ──Enter──▶ Authenticating ──PAM ok──▶ Unlock
 //!   ▲                        │  ▲                    │
-//!   └────Escape/timeout──────┘  └──── PAM fail ──────┘  (error copy, field cleared)
+//!   └────Escape/timeout──────┘  ├──── PAM fail ──────┤  (error copy, field cleared)
+//!                               │                    │
+//!                               └── Escape ≥ 60 s ───┘  (M-3: attempt abandoned)
 //! ```
 //!
 //! # The unlock-edge rule, and how this module is built to make it checkable
@@ -26,14 +28,16 @@
 //!    the crate: the enum declaration, the one arm that produces it, and the
 //!    one arm in `main.rs` that consumes it.
 //! 2. That producing arm is reachable only from
-//!    `(State::Authenticating, Message::Finished(Outcome::Authenticated))` —
-//!    and `Outcome::Authenticated` itself has exactly one construction site,
+//!    `(State::Authenticating, Message::Finished { attempt, outcome:
+//!    Outcome::Authenticated })` **and** only when `attempt` is still the
+//!    attempt this machine is running (see [`AttemptId`]) — and
+//!    `Outcome::Authenticated` itself has exactly one construction site,
 //!    in `auth::PamAuthenticator::run_pam`, after both `pam_authenticate`
 //!    and `pam_acct_mgmt` returned success.
 //! 3. Because `Effect` is an ordinary value, the claim is *testable*:
-//!    [`tests::unlock_is_produced_by_exactly_one_state_and_message`] walks
-//!    the entire cross product of states × messages and asserts
-//!    `Effect::Unlock` appears exactly once in it.
+//!    [`tests::unlock_is_produced_by_exactly_one_state_message_and_attempt`]
+//!    walks the entire cross product of states × messages × attempt tags
+//!    and asserts `Effect::Unlock` appears exactly once in it.
 //!
 //! # Time is injected, never read
 //!
@@ -65,6 +69,35 @@
 //!   user thought they had dismissed. The stale-outcome guard in
 //!   [`Reveal::update`]'s `Finished` arm closes that door from the other
 //!   side as well.
+//!
+//! # Bounding `Authenticating` (review finding M-3)
+//!
+//! Those two rules — no cancel, no timeout — plus the disabled field used
+//! to compose into a trap: a PAM module that never returned left the
+//! surface permanently inert, with no tick, no feedback and no key that did
+//! anything. (`docs/REVIEW-v0.1.md`, M-3. Not reachable with a purely local
+//! PAM stack; reachable the moment the policy grows a network-backed
+//! module, and observed for real once the installed policy started running
+//! rosec's `pam_exec` unlock helper inside `pam_authenticate`.)
+//!
+//! The fix keeps both rules and adds a bound around them:
+//!
+//! - The tick runs in `Authenticating` too, as a **stopwatch** rather than a
+//!   timeout ([`Reveal::subscription`]). After [`AUTH_HINT_AFTER`] the
+//!   surface says [`AUTH_HINT_COPY`] under the field, so the user can see it
+//!   is alive. Nothing about that is a transition.
+//! - After [`AUTH_ABANDON_AFTER`], **the user's Escape** — not a timer —
+//!   abandons the attempt back to `Revealed`, never to `Idle`
+//!   ([`Reveal::abandon`]). Nothing leaves `Authenticating` on its own;
+//!   that is the whole reason this is safe, and why the "do not time out to
+//!   `Idle`" rule above is untouched.
+//! - Because abandoning means a second attempt can start while the first is
+//!   still running, every attempt carries an [`AttemptId`] and the unlock
+//!   arm matches on it. A late answer from an abandoned attempt is inert in
+//!   every state — the pre-existing `(Revealed, Finished)` guard covers the
+//!   surface the user is looking at, and the id covers the case the guard
+//!   cannot see: the user has already resubmitted, so the machine *is* back
+//!   in `Authenticating` and would otherwise unlock on the wrong answer.
 //!
 //! # §7 / §6 styling: everything now comes from `saola-theme`
 //!
@@ -134,11 +167,86 @@ use crate::auth::{Account, AuthFuture, Authenticator, Outcome, Password};
 /// same number once.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How often the idle-timeout check runs while revealed. One second is fine
-/// granularity for a 30 s timeout and cheap: the subscription only exists in
-/// `Revealed` (see [`Reveal::subscription`]), so an at-rest lock surface
-/// still redraws only on the clock's minute tick.
+/// How long a PAM attempt may run before the surface admits it is taking a
+/// while (review finding M-3). Purely cosmetic — the machine stays in
+/// [`State::Authenticating`]; all that changes is that [`Reveal::hint`]
+/// starts saying so.
+pub const AUTH_HINT_AFTER: Duration = Duration::from_secs(5);
+
+/// How long a PAM attempt may run before Escape stops being a no-op and
+/// becomes "abandon this attempt" (review finding M-3).
+///
+/// The bound is generous on purpose. Everything below it is the old,
+/// deliberate behaviour — a live `pam_authenticate` is a blocking C call
+/// with no cancellation point, so "abandoning" it never stops it, it only
+/// stops *listening* to it. A minute is long enough that no honest local
+/// stack (`pam_unix`'s hash, a `pam_faillock` delay) reaches it, and short
+/// enough that a wedged network module does not cost the user a VT switch
+/// and a `pkill`.
+pub const AUTH_ABANDON_AFTER: Duration = Duration::from_secs(60);
+
+/// The non-fatal copy shown after [`AUTH_HINT_AFTER`]. Deliberately says
+/// nothing about *why* — the surface genuinely does not know, and a lock
+/// screen is not the place to speculate about the PAM stack in front of
+/// whoever is standing there.
+const AUTH_HINT_COPY: &str = "Still checking…";
+
+/// The copy shown after the user abandons an attempt at
+/// [`AUTH_ABANDON_AFTER`]. It is error copy (accent-light, §1) because from
+/// the user's side the attempt did fail — it just failed by never
+/// answering.
+const AUTH_ABANDONED_COPY: &str = "Authentication took too long. Try again.";
+
+/// How often the tick runs while the surface is awake. One second is fine
+/// granularity for a 30 s timeout and a 60 s bound, and cheap: the
+/// subscription does not exist in `Idle` at all (see
+/// [`Reveal::subscription`]), so an at-rest lock surface still redraws only
+/// on the clock's minute tick.
 const TICK: Duration = Duration::from_secs(1);
+
+/// Which authentication attempt a [`Message::Finished`] belongs to.
+///
+/// # Why an id at all
+///
+/// Since M-3 the user can *abandon* a slow attempt (Escape after
+/// [`AUTH_ABANDON_AFTER`]) and immediately try again — so two PAM
+/// conversations can be in flight at once, and the first one's answer can
+/// land while the second one is running. Without a tag, that late
+/// `Outcome::Authenticated` from a call the user gave up on would arrive in
+/// `Authenticating` and hit the unlock edge: a spurious unlock, the worst
+/// bug this crate can have.
+///
+/// So every attempt gets the next number, [`Reveal::attempt`] holds the
+/// live one, and the unlock arm matches on equality. An abandoned attempt's
+/// id is retired the moment it is abandoned, which makes its eventual
+/// answer unaddressed mail — dropped in every state.
+///
+/// A `u64` counter, incremented once per submission. At one attempt per
+/// nanosecond it would take about 585 years to wrap, and a lock surface
+/// that has been up that long has other problems.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttemptId(u64);
+
+impl AttemptId {
+    /// The id the next attempt gets. Wrapping rather than `+ 1` so this can
+    /// never panic on overflow in a debug build — see this module's
+    /// no-`panic!` rule. (Wrapping is safe here for the same reason the
+    /// counter is a `u64`: reaching the wrap needs more attempts than a
+    /// lock surface can live through, and even then the collision would
+    /// have to be with an attempt still in flight.)
+    fn next(self) -> Self {
+        AttemptId(self.0.wrapping_add(1))
+    }
+}
+
+/// Prints as the bare number: this appears inside [`Message`]'s hand-written
+/// `Debug`, which is what iced's tracing formats, and `AttemptId(3)` there
+/// would be noise.
+impl std::fmt::Display for AttemptId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// The widget id of the password field, used by `main.rs` to focus it.
 ///
@@ -172,11 +280,20 @@ pub enum Message {
     Changed(Password),
     /// Enter, in the password field.
     Submitted,
-    /// One [`TICK`] elapsed while revealed — the idle-timeout check.
+    /// One [`TICK`] elapsed while the surface is awake — the idle-timeout
+    /// check in `Revealed`, the attempt stopwatch in `Authenticating`.
     Tick,
     /// The authenticator finished. The **only** message that can lead to
-    /// [`Effect::Unlock`], and then only in [`State::Authenticating`].
-    Finished(Outcome),
+    /// [`Effect::Unlock`], and then only in [`State::Authenticating`] *and*
+    /// only when `attempt` is still the attempt the machine is running —
+    /// see [`AttemptId`].
+    Finished {
+        /// Which attempt answered. Stamped by `main.rs` from the
+        /// [`Effect::Authenticate`] that started it, and never invented
+        /// anywhere else.
+        attempt: AttemptId,
+        outcome: Outcome,
+    },
 }
 
 /// Hand-written rather than derived, so that `Message::Changed` cannot print
@@ -194,7 +311,9 @@ impl std::fmt::Debug for Message {
             Message::Changed(_) => f.write_str("Changed(<redacted>)"),
             Message::Submitted => f.write_str("Submitted"),
             Message::Tick => f.write_str("Tick"),
-            Message::Finished(outcome) => write!(f, "Finished({outcome:?})"),
+            Message::Finished { attempt, outcome } => {
+                write!(f, "Finished {{ attempt: {attempt}, outcome: {outcome:?} }}")
+            }
         }
     }
 }
@@ -208,8 +327,16 @@ pub enum Effect {
     /// Give the password field keyboard focus.
     Focus,
     /// Drive this authentication attempt off the UI thread and deliver its
-    /// [`Outcome`] back as [`Message::Finished`].
-    Authenticate(AuthFuture),
+    /// [`Outcome`] back as [`Message::Finished`], stamped with `attempt`.
+    ///
+    /// `main.rs` must copy `attempt` into the message verbatim: it is how
+    /// the machine tells this attempt's answer from an abandoned one's (see
+    /// [`AttemptId`]). Carrying it here rather than letting `main.rs`
+    /// invent one keeps the id's whole lifecycle inside this module.
+    Authenticate {
+        attempt: AttemptId,
+        future: AuthFuture,
+    },
     /// **THE unlock edge.** PAM authenticated the user. Produced in exactly
     /// one arm of [`Reveal::update`]; consumed in exactly one arm of
     /// `main.rs`'s `update`, which is the only place in this crate that
@@ -226,7 +353,9 @@ impl std::fmt::Debug for Effect {
         match self {
             Effect::None => f.write_str("None"),
             Effect::Focus => f.write_str("Focus"),
-            Effect::Authenticate(_) => f.write_str("Authenticate(..)"),
+            Effect::Authenticate { attempt, .. } => {
+                write!(f, "Authenticate {{ attempt: {attempt}, .. }}")
+            }
             Effect::Unlock => f.write_str("Unlock"),
         }
     }
@@ -327,9 +456,21 @@ pub struct Reveal {
     password: Password,
     /// §1-compliant error copy (accent-light on ink), or `None`.
     error: Option<String>,
+    /// The non-fatal "this is taking a while" note (M-3), or `None`. Set by
+    /// the stopwatch in [`State::Authenticating`] and cleared on every exit
+    /// from it, so it and [`Self::error`] are never both showing.
+    hint: Option<&'static str>,
     /// When the last user activity happened, for the idle timeout. Only
     /// meaningful in [`State::Revealed`].
     last_activity: Instant,
+    /// When the in-flight attempt started, for M-3's two bounds. Only
+    /// meaningful in [`State::Authenticating`]; tracked exactly the way
+    /// `last_activity` tracks the idle timeout — written from the injected
+    /// `now`, compared against it on each tick, never read off the clock.
+    attempt_started: Instant,
+    /// The attempt whose answer this machine is currently willing to act
+    /// on. See [`AttemptId`] for why that is a question at all.
+    attempt: AttemptId,
     account: Account,
     avatar: Avatar,
     /// Behind an `Arc<dyn ..>` so the tests below can substitute a fake —
@@ -352,7 +493,12 @@ impl Reveal {
             state: State::Idle,
             password: Password::default(),
             error: None,
+            hint: None,
             last_activity: now,
+            // No attempt has run yet; both of these are placeholders that
+            // the first `Submitted` overwrites before anything reads them.
+            attempt_started: now,
+            attempt: AttemptId(0),
             account,
             avatar,
             authenticator,
@@ -428,8 +574,19 @@ impl Reveal {
                 let password = std::mem::take(&mut self.password);
                 self.state = State::Authenticating;
                 self.error = None;
+                self.hint = None;
                 self.last_activity = now;
-                Effect::Authenticate(self.authenticator.authenticate(password))
+                // The attempt's identity and its stopwatch start together,
+                // and this is the only place either is set: an id is minted
+                // exactly when a PAM conversation begins, which is what
+                // makes "is this answer from the attempt I am running?" a
+                // question with a reliable answer.
+                self.attempt = self.attempt.next();
+                self.attempt_started = now;
+                Effect::Authenticate {
+                    attempt: self.attempt,
+                    future: self.authenticator.authenticate(password),
+                }
             }
 
             (State::Revealed, Message::Dismissed) => {
@@ -450,25 +607,67 @@ impl Reveal {
             // `main.rs`'s `dev-unlock` cfg block. Reachable only from this
             // exact (state, message) pair, with `Outcome::Authenticated` —
             // which `auth.rs` constructs in exactly one place, after both
-            // `pam_authenticate` and `pam_acct_mgmt` succeeded.
-            (State::Authenticating, Message::Finished(Outcome::Authenticated)) => Effect::Unlock,
+            // `pam_authenticate` and `pam_acct_mgmt` succeeded — *and* only
+            // when the answer belongs to the attempt this machine is
+            // running. The `if` is the M-3 stale-attempt guard: an
+            // abandoned attempt's late "yes" falls past this arm into the
+            // catch-all below and is dropped. See [`AttemptId`].
+            (
+                State::Authenticating,
+                Message::Finished {
+                    attempt,
+                    outcome: Outcome::Authenticated,
+                },
+            ) if attempt == self.attempt => Effect::Unlock,
 
-            (State::Authenticating, Message::Finished(Outcome::Rejected)) => {
-                self.fail(now, "Wrong password.".to_string())
+            (
+                State::Authenticating,
+                Message::Finished {
+                    attempt,
+                    outcome: Outcome::Rejected,
+                },
+            ) if attempt == self.attempt => self.fail(now, "Wrong password.".to_string()),
+
+            (
+                State::Authenticating,
+                Message::Finished {
+                    attempt,
+                    outcome: Outcome::Unavailable(copy),
+                },
+            ) if attempt == self.attempt => self.fail(now, copy),
+
+            // The stopwatch (M-3). The tick runs here now — see
+            // [`Self::ticks`] — but it counts the *attempt*, not idleness:
+            // a slow PAM module must never fold the surface away under a
+            // live conversation, so the only thing that can happen here is
+            // the hint appearing.
+            (State::Authenticating, Message::Tick) => {
+                if now.duration_since(self.attempt_started) >= AUTH_HINT_AFTER {
+                    self.hint = Some(AUTH_HINT_COPY);
+                }
+                Effect::None
             }
 
-            (State::Authenticating, Message::Finished(Outcome::Unavailable(copy))) => {
-                self.fail(now, copy)
+            // Escape: still a no-op for the first `AUTH_ABANDON_AFTER`, and
+            // then the user's way out (M-3). Nothing here *cancels* the PAM
+            // call — it cannot be cancelled — this only stops the machine
+            // listening for its answer. See [`Self::abandon`].
+            (State::Authenticating, Message::Dismissed) => {
+                if now.duration_since(self.attempt_started) >= AUTH_ABANDON_AFTER {
+                    self.abandon(now)
+                } else {
+                    Effect::None
+                }
             }
 
-            // While `Authenticating` the field is disabled, so none of these
-            // should arrive at all — they are handled explicitly rather than
-            // by a catch-all so that the "no second submission" guarantee is
-            // a property of this function, not of the view happening to
-            // render a disabled widget.
-            //
-            // Escape in particular is a no-op, not a cancel: see this
-            // module's doc comment.
+            // While `Authenticating` the field is disabled, so none of the
+            // remaining input messages should arrive at all — and neither
+            // should a `Finished` for any attempt but the live one. They are
+            // handled by one catch-all *after* the explicit arms above, so
+            // that the "no second submission" guarantee is a property of
+            // this function rather than of the view happening to render a
+            // disabled widget, and so that a stale answer is inert by
+            // default rather than by a rule someone has to remember.
             (State::Authenticating, _) => Effect::None,
 
             // ---- Everything else -------------------------------------
@@ -478,7 +677,7 @@ impl Reveal {
             // guard — without it, an `Outcome::Authenticated` delivered
             // after the machine had already returned to `Idle` would be a
             // spurious unlock, the worst bug this crate can have.
-            (State::Idle, _) | (State::Revealed, Message::Finished(_)) => Effect::None,
+            (State::Idle, _) | (State::Revealed, Message::Finished { .. }) => Effect::None,
         }
     }
 
@@ -488,6 +687,33 @@ impl Reveal {
         self.state = State::Idle;
         self.clear_secret();
         self.error = None;
+        self.hint = None;
+    }
+
+    /// **M-3's escape hatch.** The user has decided a PAM attempt that has
+    /// been running for [`AUTH_ABANDON_AFTER`] is never going to answer.
+    ///
+    /// Two things make this safe to offer, and both are load-bearing:
+    ///
+    /// 1. It returns to **`Revealed`, never `Idle`**. The review is explicit
+    ///    about that, and so is this module's doc comment: a path that
+    ///    folded the surface all the way back to rest with a live future
+    ///    still out there is the exact shape of the spurious-unlock bug.
+    ///    Staying awake also matches what the user just did — they want to
+    ///    try again, not to walk away.
+    /// 2. It **retires the attempt id** ([`AttemptId`]). From here on the
+    ///    abandoned conversation's answer is addressed to nobody: it is
+    ///    dropped in `Revealed` by the state guard, and dropped again in
+    ///    `Authenticating` by the id guard if the user has already
+    ///    resubmitted. Before the id existed, only the first of those two
+    ///    doors was closed.
+    ///
+    /// The PAM call itself keeps running — it is a blocking C call with no
+    /// cancellation point (see this module's doc comment). Abandoning is
+    /// about the user's attention, not the process's.
+    fn abandon(&mut self, now: Instant) -> Effect {
+        self.attempt = self.attempt.next();
+        self.fail(now, AUTH_ABANDONED_COPY.to_string())
     }
 
     /// PAM said no (for whatever reason): show the copy, clear the field,
@@ -500,6 +726,10 @@ impl Reveal {
         // than by relying on the submit arm.
         self.clear_secret();
         self.error = Some(copy);
+        // The attempt is over, so its stopwatch note goes with it — the
+        // error copy takes the same slot in `view`, and "Still checking…"
+        // under "Wrong password." would be a lie.
+        self.hint = None;
         self.last_activity = now;
         Effect::Focus
     }
@@ -510,11 +740,25 @@ impl Reveal {
         self.password = Password::default();
     }
 
-    /// The idle-timeout tick, and only while it can fire. `Idle` needs no
-    /// timer at all, and `Authenticating` deliberately does not time out —
-    /// `pam_authenticate` may legitimately take a while (a slow hash, a
-    /// network module), and folding the surface away underneath a live
-    /// attempt would strand its `Outcome`.
+    /// One tick per [`TICK`] whenever the surface is awake, doing a
+    /// different job in each awake state:
+    ///
+    /// - in `Revealed` it is the **idle timeout** — 30 s of no input folds
+    ///   the prompt back to rest;
+    /// - in `Authenticating` it is the **attempt stopwatch** (M-3) — it
+    ///   drives the [`AUTH_HINT_AFTER`] hint and keeps the elapsed time
+    ///   current for the [`AUTH_ABANDON_AFTER`] check on Escape.
+    ///
+    /// `Authenticating` used to have no timer, and that was the trap review
+    /// finding M-3 describes: with no tick, no cancel and a disabled field,
+    /// a `pam_authenticate` that never returned left a surface that was
+    /// permanently inert while still looking alive. The tick is **not** a
+    /// timeout there — nothing it does leaves `Authenticating` (see the
+    /// `Tick` arm) — it only lets the surface say so and lets the user's own
+    /// Escape become meaningful after a bound.
+    ///
+    /// `Idle` still runs no timer at all: there is nothing to count, and an
+    /// at-rest lock surface should redraw only on the clock's minute tick.
     ///
     /// The wake-on-input listener does **not** live here: it must run in
     /// every state (that is how `Idle` hears about the first keypress), so
@@ -531,8 +775,14 @@ impl Reveal {
     /// `iced::Subscription`'s `Debug` is opaque (`f.debug_struct(
     /// "Subscription").finish()` — it carries no recipe information), so
     /// "is the timer running?" is only assertable at this level.
+    ///
+    /// "Not `Idle`" rather than "`Revealed`" since M-3 — which makes it the
+    /// same predicate as [`Self::is_awake`], deliberately kept as its own
+    /// function because the two answer different questions (*should the
+    /// timer run* versus *should the prompt be drawn*) and could diverge
+    /// again.
     fn ticks(&self) -> bool {
-        self.state == State::Revealed
+        self.state != State::Idle
     }
 
     /// The §7 revealed stack: avatar, display name, password field, and the
@@ -600,6 +850,35 @@ impl Reveal {
                     .font(ui_font_regular(theme))
                     .size(theme.typography.size.body)
                     .color(theme.palette.accent_light.into_iced()),
+            );
+        }
+
+        // M-3's "the surface is alive" note. It takes the same slot as the
+        // error line and the two are mutually exclusive by construction
+        // (`fail` and `abandon` both clear the hint, and the hint is only
+        // ever set in `Authenticating`, which `Submitted` enters with the
+        // error already cleared) — so this `push` never stacks a second
+        // line under the first.
+        //
+        // It is **not** error copy, and must not read as any: §1's neutral
+        // ramp has a role for exactly this — `on_ink.tertiary`,
+        // "Tertiary text / metadata" — so the note sits a step below the
+        // name and the field instead of shouting in accent-light next to
+        // "Wrong password."
+        //
+        // TODO(saola-theme): this names a token directly because
+        // `saola_theme::style` has no `text` helper module at all (v0.15.0
+        // ships style helpers for containers, inputs, buttons and the rest,
+        // but text colour is applied by naming a palette/`on_ink` role at
+        // the call site — the error line above does the same). If a
+        // `style::text` module ever lands, both of these lines should move
+        // onto it rather than keep reaching for tokens by hand.
+        if let Some(hint) = self.hint {
+            stack = stack.push(
+                text(hint)
+                    .font(ui_font_regular(theme))
+                    .size(theme.typography.size.body)
+                    .color(theme.on_ink.tertiary.into_iced()),
             );
         }
 
@@ -781,6 +1060,77 @@ mod tests {
         let _ = reveal.update(Message::Changed(Password::new(value.to_string())), now);
     }
 
+    /// Deliver an [`Outcome`] for the attempt that is **currently** in
+    /// flight. Most tests below want exactly this: they are about the state
+    /// machine's edges, not about attempt tagging. The tests that *are*
+    /// about tagging (the M-3 abandon cases) build their `Finished` message
+    /// by hand from a captured, retired [`AttemptId`] instead.
+    fn finish(reveal: &mut Reveal, outcome: Outcome, now: Instant) -> Effect {
+        let attempt = reveal.attempt;
+        reveal.update(Message::Finished { attempt, outcome }, now)
+    }
+
+    /// Drive a fresh machine into `state` without using the message under
+    /// test. Shared by the two exhaustive sweeps at the bottom of this
+    /// module, which would otherwise spell it out twice.
+    fn drive_to(reveal: &mut Reveal, state: State, now: Instant) {
+        match state {
+            State::Idle => {}
+            State::Revealed => {
+                let _ = reveal.update(Message::Woke, now);
+            }
+            State::Authenticating => {
+                let _ = reveal.update(Message::Woke, now);
+                typed(reveal, now, "hunter2");
+                let _ = reveal.update(Message::Submitted, now);
+            }
+        }
+        assert_eq!(reveal.state, state, "test setup did not reach {state:?}");
+    }
+
+    /// An [`AttemptId`] the machine is **not** currently running.
+    ///
+    /// `AttemptId` is a plain counter, so "the number before the live one"
+    /// is exactly the id an abandoned attempt still carries. (In `Idle` and
+    /// `Revealed` the counter is still at its boot value and this wraps to
+    /// an id that was never issued — also not the current one, which is the
+    /// only property the guard is asserted on.)
+    fn retired(current: AttemptId) -> AttemptId {
+        AttemptId(current.0.wrapping_sub(1))
+    }
+
+    /// The message shapes both exhaustive sweeps walk. A function per shape
+    /// rather than a ready-made value, because every case needs a *fresh*
+    /// machine and `Message` is not `Copy` — and because the `Finished`
+    /// shapes have to be stamped with an attempt id chosen per case.
+    /// One entry of [`MESSAGE_SHAPES`]: a name for failure output, and a
+    /// constructor that stamps the shape with whichever [`AttemptId`] the
+    /// case under test wants. (A named type because the tuple is otherwise
+    /// complex enough to trip `clippy::type_complexity`.)
+    type MessageShape = (&'static str, fn(AttemptId) -> Message);
+
+    const MESSAGE_SHAPES: [MessageShape; 8] = [
+        ("Woke", |_| Message::Woke),
+        ("Dismissed", |_| Message::Dismissed),
+        ("Changed", |_| {
+            Message::Changed(Password::new("hunter2".to_string()))
+        }),
+        ("Submitted", |_| Message::Submitted),
+        ("Tick", |_| Message::Tick),
+        ("Finished(Authenticated)", |attempt| Message::Finished {
+            attempt,
+            outcome: Outcome::Authenticated,
+        }),
+        ("Finished(Rejected)", |attempt| Message::Finished {
+            attempt,
+            outcome: Outcome::Rejected,
+        }),
+        ("Finished(Unavailable)", |attempt| Message::Finished {
+            attempt,
+            outcome: Outcome::Unavailable("x".to_string()),
+        }),
+    ];
+
     // ---- Idle → Revealed -------------------------------------------------
 
     /// Boot state. The lock surface comes up at rest: §7's clock/date only,
@@ -926,11 +1276,17 @@ mod tests {
         typed(&mut reveal, now, "hunter2");
 
         let effect = reveal.update(Message::Submitted, now);
-        assert!(matches!(effect, Effect::Authenticate(_)));
+        // The effect carries the id of the attempt it started: that is what
+        // `main.rs` stamps onto the `Finished` message, and the whole basis
+        // of the M-3 stale-attempt guard.
+        match effect {
+            Effect::Authenticate { attempt, .. } => assert_eq!(attempt, reveal.attempt),
+            other => panic!("expected Effect::Authenticate, got {other:?}"),
+        }
         assert_eq!(reveal.state, State::Authenticating);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let effect = reveal.update(Message::Finished(Outcome::Authenticated), now);
+        let effect = finish(&mut reveal, Outcome::Authenticated, now);
         assert!(matches!(effect, Effect::Unlock));
     }
 
@@ -942,7 +1298,7 @@ mod tests {
         typed(&mut reveal, now, "wrong");
         let _ = reveal.update(Message::Submitted, now);
 
-        let effect = reveal.update(Message::Finished(Outcome::Rejected), now);
+        let effect = finish(&mut reveal, Outcome::Rejected, now);
 
         assert_eq!(reveal.state, State::Revealed);
         assert!(reveal.password.is_empty());
@@ -958,8 +1314,9 @@ mod tests {
         typed(&mut reveal, now, "hunter2");
         let _ = reveal.update(Message::Submitted, now);
 
-        let effect = reveal.update(
-            Message::Finished(Outcome::Unavailable("Not configured.".to_string())),
+        let effect = finish(
+            &mut reveal,
+            Outcome::Unavailable("Not configured.".to_string()),
             now,
         );
 
@@ -1006,7 +1363,9 @@ mod tests {
 
     /// Escape during an attempt is a no-op — not a cancel, not an unlock.
     /// See this module's doc comment for why cancelling would be the more
-    /// dangerous behaviour.
+    /// dangerous behaviour. (Since M-3 that holds *until*
+    /// [`AUTH_ABANDON_AFTER`]; the bound's two sides get their own tests
+    /// below.)
     #[test]
     fn escape_during_authentication_neither_cancels_nor_unlocks() {
         let (mut reveal, _, now) = revealed(vec![Outcome::Authenticated]);
@@ -1017,6 +1376,173 @@ mod tests {
 
         assert!(matches!(effect, Effect::None));
         assert_eq!(reveal.state, State::Authenticating);
+    }
+
+    // ---- M-3: the bounded `Authenticating` state -------------------------
+    //
+    // Review finding M-3 (`docs/REVIEW-v0.1.md`): a PAM module that never
+    // returns used to strand the surface in `Authenticating` with no tick,
+    // no feedback and no key that did anything. These four tests are the
+    // bound that finding asked for, and the fifth and sixth are the safety
+    // addition that makes it safe.
+
+    /// The stopwatch is silent for the first [`AUTH_HINT_AFTER`], then says
+    /// the surface is still alive. It is *not* a transition: the machine is
+    /// still authenticating afterwards.
+    #[test]
+    fn the_still_checking_hint_appears_only_after_the_hint_bound() {
+        let (mut reveal, _, now) = revealed(vec![Outcome::Authenticated]);
+        typed(&mut reveal, now, "hunter2");
+        let _ = reveal.update(Message::Submitted, now);
+        assert!(reveal.hint.is_none(), "no hint at the moment of submission");
+
+        // One tick short of the bound: still nothing.
+        let _ = reveal.update(Message::Tick, now + AUTH_HINT_AFTER - TICK);
+        assert!(reveal.hint.is_none(), "the hint fired early");
+
+        let _ = reveal.update(Message::Tick, now + AUTH_HINT_AFTER);
+
+        assert_eq!(reveal.hint, Some(AUTH_HINT_COPY));
+        assert_eq!(
+            reveal.state,
+            State::Authenticating,
+            "the hint is feedback, not a transition"
+        );
+    }
+
+    /// The hint belongs to the attempt, not to the surface: when the
+    /// attempt ends the hint goes with it and the error copy takes its slot.
+    #[test]
+    fn the_hint_is_cleared_when_the_attempt_ends() {
+        let (mut reveal, _, now) = revealed(vec![Outcome::Rejected]);
+        typed(&mut reveal, now, "wrong");
+        let _ = reveal.update(Message::Submitted, now);
+        let late = now + AUTH_HINT_AFTER;
+        let _ = reveal.update(Message::Tick, late);
+        assert!(reveal.hint.is_some());
+
+        let _ = finish(&mut reveal, Outcome::Rejected, late);
+
+        assert!(reveal.hint.is_none());
+        assert!(reveal.error.is_some());
+    }
+
+    /// Before [`AUTH_ABANDON_AFTER`], Escape still does nothing at all —
+    /// the no-cancel rule is unchanged, and an ignored Escape must not
+    /// quietly retire the live attempt either.
+    #[test]
+    fn escape_before_the_abandon_bound_is_still_a_no_op() {
+        let (mut reveal, _, now) = revealed(vec![Outcome::Authenticated]);
+        typed(&mut reveal, now, "hunter2");
+        let _ = reveal.update(Message::Submitted, now);
+        let attempt = reveal.attempt;
+
+        let effect = reveal.update(Message::Dismissed, now + AUTH_ABANDON_AFTER - TICK);
+
+        assert!(matches!(effect, Effect::None));
+        assert_eq!(reveal.state, State::Authenticating);
+        assert_eq!(
+            reveal.attempt, attempt,
+            "an ignored Escape must not retire the attempt"
+        );
+    }
+
+    /// After the bound, Escape abandons: back to `Revealed` (**never** to
+    /// `Idle` — see [`Reveal::abandon`]), field cleared, error copy set,
+    /// hint gone, and the attempt retired so its late answer cannot land.
+    #[test]
+    fn escape_after_the_abandon_bound_returns_to_revealed() {
+        let (mut reveal, _, now) = revealed(vec![Outcome::Authenticated]);
+        typed(&mut reveal, now, "hunter2");
+        let _ = reveal.update(Message::Submitted, now);
+        let abandoned = reveal.attempt;
+        let _ = reveal.update(Message::Tick, now + AUTH_HINT_AFTER);
+
+        let effect = reveal.update(Message::Dismissed, now + AUTH_ABANDON_AFTER);
+
+        assert_eq!(
+            reveal.state,
+            State::Revealed,
+            "abandon returns to Revealed, never to Idle"
+        );
+        assert!(reveal.password.is_empty());
+        assert!(reveal.error.is_some(), "the user gets told what happened");
+        assert!(reveal.hint.is_none());
+        assert!(matches!(effect, Effect::Focus));
+        assert_ne!(
+            reveal.attempt, abandoned,
+            "the abandoned attempt's id must be retired"
+        );
+    }
+
+    /// The abandoned PAM call is still running. When it finally answers
+    /// "yes" into the `Revealed` surface the user is looking at, the answer
+    /// is dropped — both by the state guard and by the attempt id.
+    #[test]
+    fn an_abandoned_attempts_success_is_ignored_in_revealed() {
+        let (mut reveal, _, now) = revealed(vec![Outcome::Authenticated]);
+        typed(&mut reveal, now, "hunter2");
+        let _ = reveal.update(Message::Submitted, now);
+        let abandoned = reveal.attempt;
+        let later = now + AUTH_ABANDON_AFTER;
+        let _ = reveal.update(Message::Dismissed, later);
+        assert_eq!(reveal.state, State::Revealed);
+
+        let effect = reveal.update(
+            Message::Finished {
+                attempt: abandoned,
+                outcome: Outcome::Authenticated,
+            },
+            later,
+        );
+
+        assert!(matches!(effect, Effect::None));
+        assert_eq!(reveal.state, State::Revealed);
+    }
+
+    /// The case the attempt id exists for. After abandoning, the user tries
+    /// again — so the machine is back in `Authenticating`, where a
+    /// `Finished(Authenticated)` *does* unlock. The abandoned call's late
+    /// "yes" must still not be the one that does it.
+    #[test]
+    fn an_abandoned_attempts_success_never_unlocks_the_next_attempt() {
+        let (mut reveal, _, now) = revealed(vec![Outcome::Authenticated, Outcome::Authenticated]);
+        typed(&mut reveal, now, "hunter2");
+        let _ = reveal.update(Message::Submitted, now);
+        let abandoned = reveal.attempt;
+
+        let later = now + AUTH_ABANDON_AFTER;
+        let _ = reveal.update(Message::Dismissed, later);
+
+        // Second attempt: two PAM calls are now in flight at once.
+        typed(&mut reveal, later, "hunter2");
+        let _ = reveal.update(Message::Submitted, later);
+        let current = reveal.attempt;
+        assert_ne!(current, abandoned);
+        assert_eq!(reveal.state, State::Authenticating);
+
+        let effect = reveal.update(
+            Message::Finished {
+                attempt: abandoned,
+                outcome: Outcome::Authenticated,
+            },
+            later,
+        );
+        assert!(
+            matches!(effect, Effect::None),
+            "a retired attempt unlocked the screen"
+        );
+        assert_eq!(reveal.state, State::Authenticating);
+
+        // The live attempt's own answer is the one that counts.
+        let effect = reveal.update(
+            Message::Finished {
+                attempt: current,
+                outcome: Outcome::Authenticated,
+            },
+            later,
+        );
+        assert!(matches!(effect, Effect::Unlock));
     }
 
     /// The timeout does not fire under a live attempt.
@@ -1039,13 +1565,13 @@ mod tests {
 
         typed(&mut reveal, now, "wrong");
         let _ = reveal.update(Message::Submitted, now);
-        let effect = reveal.update(Message::Finished(Outcome::Rejected), now);
+        let effect = finish(&mut reveal, Outcome::Rejected, now);
         assert!(matches!(effect, Effect::Focus));
         assert_eq!(reveal.state, State::Revealed);
 
         typed(&mut reveal, now, "right");
         let _ = reveal.update(Message::Submitted, now);
-        let effect = reveal.update(Message::Finished(Outcome::Authenticated), now);
+        let effect = finish(&mut reveal, Outcome::Authenticated, now);
 
         assert!(matches!(effect, Effect::Unlock));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -1100,7 +1626,7 @@ mod tests {
         let (mut reveal, _, now) = revealed(vec![Outcome::Rejected]);
         typed(&mut reveal, now, "wrong");
         let _ = reveal.update(Message::Submitted, now);
-        let _ = reveal.update(Message::Finished(Outcome::Rejected), now);
+        let _ = finish(&mut reveal, Outcome::Rejected, now);
         assert!(reveal.error.is_some());
 
         typed(&mut reveal, now, "r");
@@ -1113,7 +1639,7 @@ mod tests {
         let (mut reveal, _, now) = revealed(vec![Outcome::Rejected]);
         typed(&mut reveal, now, "wrong");
         let _ = reveal.update(Message::Submitted, now);
-        let _ = reveal.update(Message::Finished(Outcome::Rejected), now);
+        let _ = finish(&mut reveal, Outcome::Rejected, now);
         assert!(reveal.error.is_some());
 
         let _ = reveal.update(Message::Dismissed, now);
@@ -1135,81 +1661,66 @@ mod tests {
     fn stale_success_outside_authenticating_never_unlocks() {
         // Delivered in Idle.
         let (mut reveal, _, now) = reveal_with(vec![]);
-        let effect = reveal.update(Message::Finished(Outcome::Authenticated), now);
+        let effect = finish(&mut reveal, Outcome::Authenticated, now);
         assert!(matches!(effect, Effect::None));
         assert_eq!(reveal.state, State::Idle);
 
         // Delivered in Revealed.
         let (mut reveal, _, now) = revealed(vec![]);
-        let effect = reveal.update(Message::Finished(Outcome::Authenticated), now);
+        let effect = finish(&mut reveal, Outcome::Authenticated, now);
         assert!(matches!(effect, Effect::None));
         assert_eq!(reveal.state, State::Revealed);
     }
 
     /// **The unlock-edge rule, as an executable assertion.**
     ///
-    /// Walks the entire cross product of states × messages and counts how
-    /// many combinations produce [`Effect::Unlock`]. Exactly one may:
-    /// `(Authenticating, Finished(Authenticated))`. Any new message variant,
-    /// or any new arm that reaches the unlock edge, fails this test — which
-    /// is the point. (New `State`/`Message` variants must be added to the
-    /// lists below; the compiler cannot enumerate them for us, so the
-    /// `matches!` sweep in `every_state_and_message_pair_is_covered` pins
-    /// the counts too.)
+    /// Walks the entire cross product of states × messages × attempt tags
+    /// and counts how many combinations produce [`Effect::Unlock`]. Exactly
+    /// one may: `(Authenticating, Finished { the current attempt,
+    /// Authenticated })`. Any new message variant, or any new arm that
+    /// reaches the unlock edge, fails this test — which is the point.
+    ///
+    /// The third dimension is M-3's safety addition: every message is
+    /// delivered twice, once stamped with the id of the attempt the machine
+    /// is actually running and once with a [`retired`] one, so that
+    /// "a late answer from an abandoned attempt cannot unlock" is proven
+    /// against *every* state rather than only the two the abandon tests
+    /// walk through by hand.
+    ///
+    /// (New `State`/`Message` variants must be added to [`MESSAGE_SHAPES`];
+    /// the compiler cannot enumerate them for us, so
+    /// `no_state_and_message_pair_panics` sweeps the same list.)
     #[test]
-    fn unlock_is_produced_by_exactly_one_state_and_message() {
+    fn unlock_is_produced_by_exactly_one_state_message_and_attempt() {
         let states = [State::Idle, State::Revealed, State::Authenticating];
-        let messages = || {
-            vec![
-                ("Woke", Message::Woke),
-                ("Dismissed", Message::Dismissed),
-                (
-                    "Changed",
-                    Message::Changed(Password::new("hunter2".to_string())),
-                ),
-                ("Submitted", Message::Submitted),
-                ("Tick", Message::Tick),
-                (
-                    "Finished(Authenticated)",
-                    Message::Finished(Outcome::Authenticated),
-                ),
-                ("Finished(Rejected)", Message::Finished(Outcome::Rejected)),
-                (
-                    "Finished(Unavailable)",
-                    Message::Finished(Outcome::Unavailable("x".to_string())),
-                ),
-            ]
-        };
+        let tags = [("current attempt", true), ("retired attempt", false)];
 
         let mut unlocking = Vec::new();
         for state in states {
-            for (name, message) in messages() {
-                let (mut reveal, _, now) = reveal_with(vec![Outcome::Authenticated]);
-                // Drive the machine into `state` without going through the
-                // message under test.
-                match state {
-                    State::Idle => {}
-                    State::Revealed => {
-                        let _ = reveal.update(Message::Woke, now);
-                    }
-                    State::Authenticating => {
-                        let _ = reveal.update(Message::Woke, now);
-                        typed(&mut reveal, now, "hunter2");
-                        let _ = reveal.update(Message::Submitted, now);
-                    }
-                }
-                assert_eq!(reveal.state, state, "test setup did not reach {state:?}");
+            for (tag_name, is_current) in tags {
+                for (name, build) in MESSAGE_SHAPES {
+                    // A fresh machine per case, driven into `state` without
+                    // going through the message under test.
+                    let (mut reveal, _, now) = reveal_with(vec![Outcome::Authenticated]);
+                    drive_to(&mut reveal, state, now);
 
-                if matches!(reveal.update(message, now), Effect::Unlock) {
-                    unlocking.push(format!("{state:?} + {name}"));
+                    let attempt = if is_current {
+                        reveal.attempt
+                    } else {
+                        retired(reveal.attempt)
+                    };
+
+                    if matches!(reveal.update(build(attempt), now), Effect::Unlock) {
+                        unlocking.push(format!("{state:?} + {name} ({tag_name})"));
+                    }
                 }
             }
         }
 
         assert_eq!(
             unlocking,
-            vec!["Authenticating + Finished(Authenticated)".to_string()],
-            "the set of (state, message) pairs that unlock changed"
+            vec!["Authenticating + Finished(Authenticated) (current attempt)".to_string()],
+            "the set of (state, message, attempt) triples that unlock changed"
         );
     }
 
@@ -1219,56 +1730,54 @@ mod tests {
     #[test]
     fn no_state_and_message_pair_panics() {
         for start in [State::Idle, State::Revealed, State::Authenticating] {
-            for message in [
-                Message::Woke,
-                Message::Dismissed,
-                Message::Changed(Password::new("x".to_string())),
-                Message::Submitted,
-                Message::Tick,
-                Message::Finished(Outcome::Authenticated),
-                Message::Finished(Outcome::Rejected),
-                Message::Finished(Outcome::Unavailable("x".to_string())),
-            ] {
-                let (mut reveal, _, now) = reveal_with(vec![Outcome::Rejected]);
-                match start {
-                    State::Idle => {}
-                    State::Revealed => {
-                        let _ = reveal.update(Message::Woke, now);
-                    }
-                    State::Authenticating => {
-                        let _ = reveal.update(Message::Woke, now);
-                        typed(&mut reveal, now, "x");
-                        let _ = reveal.update(Message::Submitted, now);
-                    }
+            for is_current in [true, false] {
+                for (_, build) in MESSAGE_SHAPES {
+                    let (mut reveal, _, now) = reveal_with(vec![Outcome::Rejected]);
+                    drive_to(&mut reveal, start, now);
+
+                    let attempt = if is_current {
+                        reveal.attempt
+                    } else {
+                        retired(reveal.attempt)
+                    };
+
+                    // Deliberately far past both M-3 bounds, so the
+                    // stopwatch arithmetic is swept too — including the
+                    // states where `attempt_started` is not meaningful.
+                    let _ = reveal.update(build(attempt), now + AUTH_ABANDON_AFTER + IDLE_TIMEOUT);
+                    assert!(matches!(
+                        reveal.state,
+                        State::Idle | State::Revealed | State::Authenticating
+                    ));
                 }
-                let _ = reveal.update(message, now);
-                assert!(matches!(
-                    reveal.state,
-                    State::Idle | State::Revealed | State::Authenticating
-                ));
             }
         }
     }
 
     // ---- Subscription ----------------------------------------------------
 
-    /// The idle-timeout tick only exists where it can fire: not at rest
-    /// (nothing to time out, and an idle lock surface should redraw only on
-    /// the clock's minute tick), and not during an attempt (see the
-    /// `timeout_does_not_fire_while_authenticating` case for why).
+    /// The tick exists wherever it has work: the idle timeout in
+    /// `Revealed`, and — since M-3 — the attempt stopwatch in
+    /// `Authenticating`. Only at rest is there nothing to count, and an idle
+    /// lock surface should redraw only on the clock's minute tick.
+    ///
+    /// Note what the `Authenticating` half does **not** mean: the tick runs
+    /// there, but the *idle timeout* still does not fire (see
+    /// `timeout_does_not_fire_while_authenticating`). Same subscription,
+    /// different job.
     #[test]
-    fn the_timeout_tick_runs_only_while_revealed() {
+    fn the_tick_runs_whenever_the_surface_is_awake() {
         let (mut reveal, _, now) = reveal_with(vec![Outcome::Authenticated]);
-        assert!(!reveal.ticks(), "Idle should not run the timeout tick");
+        assert!(!reveal.ticks(), "Idle should not run the tick");
 
         let _ = reveal.update(Message::Woke, now);
-        assert!(reveal.ticks(), "Revealed should run the timeout tick");
+        assert!(reveal.ticks(), "Revealed should run the idle-timeout tick");
 
         typed(&mut reveal, now, "hunter2");
         let _ = reveal.update(Message::Submitted, now);
         assert!(
-            !reveal.ticks(),
-            "Authenticating should not run the timeout tick"
+            reveal.ticks(),
+            "Authenticating should run the M-3 attempt stopwatch"
         );
     }
 
@@ -1363,8 +1872,14 @@ mod tests {
     #[test]
     fn message_debug_shows_outcomes() {
         assert_eq!(
-            format!("{:?}", Message::Finished(Outcome::Authenticated)),
-            "Finished(Authenticated)"
+            format!(
+                "{:?}",
+                Message::Finished {
+                    attempt: AttemptId(7),
+                    outcome: Outcome::Authenticated,
+                }
+            ),
+            "Finished { attempt: 7, outcome: Authenticated }"
         );
     }
 }

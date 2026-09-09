@@ -237,13 +237,22 @@
 //! above) is the only thing `iced_sessionlock`'s runtime turns into an
 //! actual `ext-session-lock-v1` unlock request. It is reachable only when
 //! `modules::reveal`'s state machine returns `Effect::Unlock`, which happens
-//! only for `(State::Authenticating, Message::Finished(
-//! Outcome::Authenticated))`, which in turn requires an
+//! only for `(State::Authenticating, Message::Finished { attempt, outcome:
+//! Outcome::Authenticated })` **with `attempt` still the attempt that
+//! machine is running** (the M-3 stale-attempt guard — see
+//! `modules::reveal::AttemptId`), which in turn requires an
 //! `auth::Outcome::Authenticated` — a value `auth::PamAuthenticator::run_pam`
 //! constructs in exactly one place, after both `pam_authenticate` *and*
 //! `pam_acct_mgmt` returned success. `grep -rn 'Message::UnLock' src/` shows
 //! the complete list: the `TryInto` interception arm, this arm, and the
 //! `#[cfg(feature = "dev-unlock")]` arm below.
+//!
+//! **What this file contributes to that guard.** The `Effect::Authenticate`
+//! arm below carries the attempt id from the state machine into the
+//! `Message::Finished` it builds when the future resolves, and copies it
+//! verbatim. That is the only place an id crosses this file, and it must
+//! stay a copy: an id minted or altered here would let an answer from a
+//! conversation the user abandoned pass for a live one.
 //!
 //! **Layering.** `view` gains one layer and one conditional sibling.
 //! Between the wallpaper and the centred content there is now a style guide
@@ -553,8 +562,15 @@ impl Lockscreen {
                 // `auth::PamAuthenticator::authenticate`); all that happens
                 // here is handing it to iced's executor and routing its
                 // `Outcome` back into the state machine as a message.
-                Effect::Authenticate(future) => Task::perform(future, |outcome| {
-                    Message::Reveal(modules::reveal::Message::Finished(outcome))
+                // The `attempt` id is minted by the state machine and only
+                // copied here — it is how the machine tells this attempt's
+                // answer from one it has abandoned (see
+                // `modules::reveal::AttemptId`, and the M-3 section of that
+                // module's doc comment). `AttemptId` is `Copy`, so the
+                // `move` closure below carries it into the future's
+                // completion without borrowing anything.
+                Effect::Authenticate { attempt, future } => Task::perform(future, move |outcome| {
+                    Message::Reveal(modules::reveal::Message::Finished { attempt, outcome })
                 }),
 
                 // ==================================================
@@ -568,8 +584,10 @@ impl Lockscreen {
                 //  Stage 2 doc section). Nothing else in the crate may
                 //  produce `Effect::Unlock`; see `modules::reveal`'s
                 //  doc comment and its
-                //  `unlock_is_produced_by_exactly_one_state_and_message`
-                //  test, which asserts that as an executable claim.
+                //  `unlock_is_produced_by_exactly_one_state_message_and_attempt`
+                //  test, which asserts that as an executable claim —
+                //  including, since M-3, that an abandoned attempt's late
+                //  `Outcome::Authenticated` never reaches this arm.
                 // ==================================================
                 Effect::Unlock => Task::done(Message::UnLock),
             },

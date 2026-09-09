@@ -53,11 +53,24 @@ src/
 ```
 Idle ──click/keypress──▶ Revealed ──Enter──▶ Authenticating ──PAM ok──▶ Unlock
   ▲                        │  ▲                    │
-  └────Escape/timeout──────┘  └──── PAM fail ──────┘  (error copy, field cleared)
+  └────Escape/timeout──────┘  ├──── PAM fail ──────┤  (error copy, field cleared)
+                              │                    │
+                              └── Escape ≥ 60 s ───┘  (M-3: attempt abandoned)
 ```
 
 - PAM conversation runs on a blocking thread (`spawn_blocking`); the UI thread never
   blocks. While `Authenticating`, the password field is disabled — no second submission.
+- **`Authenticating` is bounded** (review finding M-3). The tick runs there as a
+  stopwatch, not a timeout: after `AUTH_HINT_AFTER` (5 s) the surface shows the
+  non-fatal note "Still checking…" so the user can see it is alive, and after
+  `AUTH_ABANDON_AFTER` (60 s) the user's **Escape** — never a timer — abandons the
+  attempt back to `Revealed` (**never** to `Idle`) with error copy and a cleared field.
+  Nothing leaves `Authenticating` on its own, which is what keeps this safe. Because
+  abandoning lets a second attempt start while the first is still running, every attempt
+  carries an `AttemptId` and the unlock arm matches on it: an abandoned attempt's late
+  `Outcome::Authenticated` is inert in every state. `main.rs` only *copies* that id from
+  `Effect::Authenticate` into `Message::Finished` — minting or altering one there would
+  re-open the hole.
 - Password buffers are `zeroize`d immediately after the conversation consumes them.
 - No `panic!`/`unwrap`/`expect` on any runtime path (clippy-enforced at Stage 6's
   review): errors surface as §1-compliant error copy (accent-light `#F6A06B` on ink) and
